@@ -1,0 +1,28 @@
+# NU1 hard-fork REHEARSAL bridge — TEST ONLY.
+#
+# Points at the isolated NU1 test chain on VPS3 (genesis acd3410d…, wire-incompatible
+# with live zkas-mainnet, so nothing mined here can ever reach the real network).
+# Runs as a SEPARATE process on spare ports so the live pool on :5555/:5577 is
+# untouched — point hashrate at :5601 to join the rehearsal, and nothing else moves.
+#
+# Requires BRIDGE_ALLOW_UNSYNCED=1 in the environment: a peerless solo test node
+# reports is_synced=false forever and the bridge would otherwise wait for sync.
+kaspad_address: "204.10.194.28:17910"
+block_wait_time: 1000
+print_stats: true
+log_to_file: false
+health_check_port: ""
+web_dashboard_port: ":3034"
+var_diff: false
+shares_per_min: 20
+var_diff_stats: false
+pow2_clamp: true
+extranonce_size: 2
+coinbase_tag_suffix: "zkasnu1"
+instances:
+  - stratum_port: ":5601"
+    min_share_diff: 8192
+    prom_port: ":2119"
+    var_diff: true
+    shares_per_min: 20
+    log_to_file: false

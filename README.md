@@ -63,7 +63,7 @@ You do **not** need this codebase to run a ZKas pool. Because the PoW is byte-id
 to Kaspa, your stratum layer, share validation, vardiff and difficulty maths need no
 changes at all — an unmodified Kaspa ASIC hashes ZKas headers correctly.
 
-Exactly **three** things are mandatory, and [`help.txt`](help.txt) walks each one to the
+Exactly **three** things are mandatory, and [`POOL-INTEGRATION.md`](POOL-INTEGRATION.md) walks each one to the
 exact file and symbol in the [node source](https://github.com/firecash/zkas-rusty):
 
 1. **The payout address is a shielded (Orchard) address, version 9.** The coinbase output
@@ -72,13 +72,13 @@ exact file and symbol in the [node source](https://github.com/firecash/zkas-rust
 2. **The coinbase carries a mandatory dev-fee output.** Submit the node's template
    coinbase verbatim. If you cache templates and rewrite `outputs.last()`, you rewrite
    the *dev fee* and lose the block — this is the single most expensive integration bug
-   (see help.txt §3).
+   (see POOL-INTEGRATION.md §3).
 3. **The coinbase payload has an extra 32-byte field** (the shielded state root, between
    `subsidy` and the script-pubkey block). Any pool that writes its extranonce at a
    hardcoded offset corrupts the payload on ZKas.
 
 Merged mining and custodial shielded payouts are optional; both are specified end to end
-in [`help.txt`](help.txt) §4 and §6.
+in [`POOL-INTEGRATION.md`](POOL-INTEGRATION.md) §4 and §6.
 
 ## Status
 
@@ -128,7 +128,7 @@ stratum port with your `zkas:` payout address (legacy `firecash:` accepted) as t
 stratum+tcp://<pool-host>:<port>   user=zkas:<your-address>   pass=x
 ```
 
-(The password field is unused; `x` or empty is fine.) See [`help.txt`](help.txt) for the
+(The password field is unused; `x` or empty is fine.) See [`POOL-INTEGRATION.md`](POOL-INTEGRATION.md) for the
 full integration guide: node setup, native vs. AuxPoW merged mining, the
 exact consensus files to read, and an error-message-to-cause table.
 
@@ -157,7 +157,7 @@ cargo run --release --bin katpool
 ```
 
 You also need a reachable ZKas node (`kaspad`) with `--utxoindex`. See
-[`help.txt`](help.txt) §2 for node setup and the stratum bridge config
+[`POOL-INTEGRATION.md`](POOL-INTEGRATION.md) §2 for node setup and the stratum bridge config
 ([`zkas-bridge.yaml`](zkas-bridge.yaml)).
 
 ## Operating principles
@@ -174,7 +174,7 @@ You also need a reachable ZKas node (`kaspad`) with `--utxoindex`. See
 
 ## Documentation
 
-Start at [`docs/README.md`](docs/README.md) for the index and [`help.txt`](help.txt) for
+Start at [`docs/README.md`](docs/README.md) for the index and [`POOL-INTEGRATION.md`](POOL-INTEGRATION.md) for
 the operator guide. Some `docs/` pages still carry upstream (Kaspa/KRC-20) specifics and
 are being migrated to ZKas.
 

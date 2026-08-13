@@ -24,8 +24,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 INSTANCE_PORTS = [2114, 2115, 2116, 2117, 2118]
 LISTEN = ("127.0.0.1", 3034)
-REWARD_FC = 57          # miner payout from the 60 ZKAS gross coinbase reward:
-                        # 95% to the miner, 5% (3 ZKAS at launch) to development
+# The subsidy is a live consensus value; it decays continuously, so a launch
+# constant (57 from the old 60-ZKAS subsidy) must never be used for the public
+# dashboard or miner totals.  Keep a legacy fallback only for a temporary
+# explorer outage; it is not used while the live endpoint is reachable.
+REWARD_API_URL = os.environ.get(
+    "ZKAS_REWARD_API_URL", "https://explorer.zkas.info/api/info/blockreward"
+)
+LEGACY_REWARD_FC = 57.0
+_reward_cache = {"miner": LEGACY_REWARD_FC, "ts": 0.0}
+_reward_lock = threading.Lock()
+REWARD_CACHE_SECS = 60.0
 TWO32 = 2 ** 32
 SAMPLE_SECS = 5         # scrape cadence (server-side refresh; client polls ~5s too)
 WINDOW_SECS = 600       # hashrate = Δ(share-diff) · 2^32 / Δt over a 10-min rolling window
@@ -171,8 +180,8 @@ _blockshare = collections.deque()
 BLOCKSHARE_WINDOW = 900   # 10-15 min of blocks for a stable share estimate
 BLOCKSHARE_MIN_NET = 30   # need at least this many network blocks before trusting it
 
-# ---- per-wallet payout history (solo model: 1 confirmed block = 57 ZKAS paid
-# by the chain to that wallet). Fed from the bridge's recent-blocks list and
+# ---- per-wallet payout history (solo model: one accepted block pays the
+# consensus miner share to that wallet). Fed from the bridge's recent-blocks list and
 # persisted to disk so it survives redactor AND bridge restarts. ------------
 PAYOUT_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "redactor-payout-history.json")
@@ -183,6 +192,82 @@ _payouts_lock = threading.Lock()
 _payouts = {}                   # wallet -> [{"ts","worker","hash"}] newest LAST
 _payouts_seen = set()           # block hashes already recorded
 _payouts_dirty = False
+
+
+def current_miner_reward():
+    """Return the current 95%-of-subsidy miner reward in ZKAS.
+
+    `blockreward` is emitted by the consensus-backed explorer API.  Cache it
+    briefly so a dashboard refresh cannot fan out requests, and retain the
+    last good value during a short API outage.  This replaces the old fixed
+    57-ZKAS value, which became wrong as the emission curve decayed.
+    """
+    now = time.time()
+    with _reward_lock:
+        if now - _reward_cache["ts"] < REWARD_CACHE_SECS and _reward_cache["miner"] > 0:
+            return _reward_cache["miner"]
+    try:
+        req = urllib.request.Request(REWARD_API_URL, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            payload = json.loads(resp.read().decode())
+        gross = float(payload.get("blockreward"))
+        miner = gross * 0.95
+        if not (miner > 0 and miner < 1_000_000):
+            raise ValueError("invalid block reward")
+        with _reward_lock:
+            _reward_cache.update(miner=miner, ts=now)
+            return miner
+    except Exception:
+        with _reward_lock:
+            return _reward_cache["miner"] or LEGACY_REWARD_FC
+
+# Lifetime headline counters must survive a bridge restart. Prometheus worker
+# counters are process-local, so publishing their raw sum made the dashboard
+# jump from thousands of blocks back to zero whenever Stratum was restarted.
+# Store the last raw bridge counters and add only their positive delta. If the
+# raw value regresses, a new bridge epoch began and its full current value is
+# the delta. The file is tiny and is written atomically.
+LIFETIME_TOTALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "redactor-lifetime-totals.json")
+_lifetime = {"totalShares": 0, "totalBlocks": 0,
+             "rawShares": 0, "rawBlocks": 0, "savedAt": 0}
+_lifetime_last_save = 0.0
+
+
+def _lifetime_load():
+    global _lifetime
+    try:
+        with open(LIFETIME_TOTALS_FILE, encoding="utf-8") as f:
+            loaded = json.load(f)
+        for key in _lifetime:
+            _lifetime[key] = int(loaded.get(key, _lifetime[key]))
+    except Exception:
+        pass
+
+
+def _lifetime_update(raw_shares, raw_blocks):
+    """Return monotonic (shares, blocks) across bridge and redactor restarts."""
+    global _lifetime_last_save
+    raw_shares, raw_blocks = max(0, int(raw_shares)), max(0, int(raw_blocks))
+    previous_shares, previous_blocks = _lifetime["rawShares"], _lifetime["rawBlocks"]
+    share_delta = raw_shares if raw_shares < previous_shares else raw_shares - previous_shares
+    block_delta = raw_blocks if raw_blocks < previous_blocks else raw_blocks - previous_blocks
+    _lifetime["totalShares"] += share_delta
+    _lifetime["totalBlocks"] += block_delta
+    _lifetime["rawShares"], _lifetime["rawBlocks"] = raw_shares, raw_blocks
+
+    now = time.time()
+    if block_delta or now - _lifetime_last_save >= 30:
+        _lifetime["savedAt"] = int(now)
+        tmp = LIFETIME_TOTALS_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(_lifetime, f)
+            os.replace(tmp, LIFETIME_TOTALS_FILE)
+            _lifetime_last_save = now
+        except Exception:
+            pass
+    return _lifetime["totalShares"], _lifetime["totalBlocks"]
 
 
 def _payouts_load():
@@ -218,6 +303,7 @@ def _payouts_load():
 def _payouts_record(blocks):
     """Append new bridge blocks (wallet, worker, hash, timestamp) to history."""
     global _payouts_dirty
+    reward = current_miner_reward()
     with _payouts_lock:
         for b in blocks or []:
             h, w = b.get("hash"), b.get("wallet")
@@ -229,7 +315,10 @@ def _payouts_record(blocks):
             except (TypeError, ValueError):
                 ts = int(time.time())
             lst = _payouts.setdefault(w, [])
-            lst.append({"ts": ts, "worker": b.get("worker") or "—", "hash": h})
+            # Persist the value observed when this block was recorded.  Payout
+            # history must not be re-priced every time the emission curve moves.
+            lst.append({"ts": ts, "worker": b.get("worker") or "—", "hash": h,
+                        "amountFc": reward})
             # Blocks can be delivered by the bridge out of timestamp order.
             # Retain the newest records by timestamp, otherwise a late-arriving
             # old block can evict a genuinely newer payout from the history.
@@ -262,8 +351,14 @@ def payout_history(wallet, limit=50):
         # order can hide newer payouts (for example July 30 entries behind
         # later-arriving July 28 records).
         lst = sorted(_payouts.get(wallet, []), key=lambda e: int(e.get("ts", 0)))
+    # Old records predate amount persistence.  Re-price only those legacy rows
+    # with the live consensus value; new rows retain the amount observed at
+    # block discovery.  This removes the stale 57-ZKAS display immediately
+    # without changing rows that already carry an exact amount.
+    live_reward = current_miner_reward()
     return [{"ts": e["ts"], "worker": e["worker"], "hash": e["hash"],
-             "amountFc": REWARD_FC} for e in reversed(lst[-limit:])]
+             "amountFc": float(e.get("amountFc", live_reward))}
+            for e in reversed(lst[-limit:])]
 
 
 def remote_pool_workers():
@@ -347,7 +442,7 @@ def sample():
         if bt is not None:
             bridge_total_blocks = int(bt)
         # Record newly found blocks into the persistent per-wallet payout
-        # history (solo model: each confirmed block = one 60-ZKAS payout).
+        # history using the live consensus subsidy.
         _payouts_record(bjson.get("blocks") or [])
         _payouts_save()
         for bw in (bjson.get("workers") or []):
@@ -440,7 +535,9 @@ def sample():
         if k not in live:
             _hist.pop(k, None)
 
-    blocks_found = int(sum(found.values()))
+    raw_shares = int(sum(shares.values()))
+    raw_blocks_found = int(sum(found.values()))
+    total_shares, blocks_found = _lifetime_update(raw_shares, raw_blocks_found)
 
     # ---- Network + pool hashrate, both grounded in the node ----------------
     # Network = the node's measured EstimateNetworkHashesPerSecond (authoritative;
@@ -499,7 +596,7 @@ def sample():
             # Prom counter series persist for every session since bridge start, so
             # counting raw series keys inflates this with long-disconnected rigs.
             "activeWorkers": sum(1 for w in workers if w.get("online")),
-            "totalShares": int(sum(shares.values())),
+            "totalShares": total_shares,
             "totalBlocks": blocks_found,
             "bridgeUptime": int(now - START),
             "workers": workers,
@@ -585,11 +682,14 @@ def miner(address, stats, bbw):
     address = (address or "").strip()
     workers = [w for w in (stats.get("workers") or []) if w.get("wallet") == address]
     blk = bbw.get(address, {"found": 0, "confirmed": 0, "pending": 0})
+    history = payout_history(address)
     confirmed = blk["confirmed"]
     pending = blk.get("pending") or max(0, blk["found"] - confirmed)
     return {
         "address": address,
-        "found": bool(workers) or address in bbw,
+        # A bridge restart can clear the in-memory counters while the
+        # persisted payout history still proves this address has pool activity.
+        "found": bool(workers) or address in bbw or bool(history),
         "workers": [{
             "worker": w.get("worker") or "—",
             "hashrate": w.get("hashrate"),   # GH/s (0 for offline sessions)
@@ -608,11 +708,12 @@ def miner(address, stats, bbw):
         "blocksFound": blk["found"],
         "blocksConfirmed": confirmed,
         "blocksPending": pending,
-        "paidFc": confirmed * REWARD_FC,
-        "pendingFc": pending * REWARD_FC,
-        # Per-block payout history (solo model: each confirmed block paid
-        # 57 ZKAS straight to this wallet by the chain). Newest first.
-        "payouts": payout_history(address),
+        # Use the current consensus value for aggregate balances. Per-block
+        # history retains the exact value observed when each block was found.
+        "paidFc": confirmed * current_miner_reward(),
+        "pendingFc": pending * current_miner_reward(),
+        # Per-block payout history, newest first.
+        "payouts": history,
     }
 
 
@@ -656,6 +757,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    _lifetime_load()
     _payouts_load()  # payout history survives redactor + bridge restarts
     # Bind immediately. A synchronous initial scrape can take several seconds
     # when a node/explorer dependency is slow, producing a 502 window on every

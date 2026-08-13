@@ -5,7 +5,7 @@
 # zkas-pool-port-aliases.service; they are intentionally not separate pool
 # instances. Miner application selection still chooses a coherent GodMiner
 # legacy or Kaspa Common profile.
-kaspad_address: "127.0.0.1:16110"
+kaspad_address: "204.10.194.28:17950"
 # ZKAS is 1 BPS. This is the ZKAS-template safety fallback; real Kaspa
 # parent templates are observed immediately, then notifications are coalesced
 # per miner profile (legacy ASIC default 1000ms, Common default 500ms).
