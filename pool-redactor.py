@@ -57,6 +57,13 @@ RX_SHARES = _rx("ks_valid_share_counter")       # cumulative valid shares per wo
 RX_FOUND = _rx("ks_blocks_accepted_by_node")    # blocks found per worker
 RX_MINED = _rx("ks_blocks_mined")               # confirmed/paid per worker
 RX_PENDING = _rx("ks_blocks_not_confirmed_blue")  # maturing per worker
+RX_KAS = _rx("ks_merged_parent_submit_total")   # merged parents Kaspa ACCEPTED, per worker
+# Only this outcome is a Kaspa block that landed. The bridge never emits the
+# counter for parents that failed to clear Kaspa's target (see
+# `record_merged_parent_submit`), so "accepted" is the whole story; `zkas_claim`
+# is summed across first/duplicate because a duplicate ZKas claim is still a
+# distinct, reward-bearing Kaspa block.
+KAS_ACCEPTED = "accepted"
 RX_NETHR = re.compile(r'^ks_estimated_network_hashrate_gauge\s+([0-9.eE+-]+)', re.M)
 RX_NETBLK = re.compile(r'^ks_network_block_count\s+([0-9.eE+-]+)', re.M)
 RX_NETDIFF = re.compile(r'^ks_network_difficulty_gauge\s+([0-9.eE+-]+)', re.M)
@@ -164,11 +171,38 @@ def _agg_sessions(rx, text, out):
         out[k] = out.get(k, 0.0) + v
 
 
+def _agg_sessions_where(rx, text, out, **want):
+    """`_agg_sessions`, restricted to series whose labels match `want`.
+
+    Needed for `ks_merged_parent_submit_total`, which carries an `outcome` label
+    — summing every outcome would count rejected submissions as found blocks."""
+    per_session = {}
+    for labels, val in rx.findall(text):
+        lb = _labels(labels)
+        if any(lb.get(k) != v for k, v in want.items()):
+            continue
+        w, wk = lb.get("wallet"), lb.get("worker")
+        if not w:
+            continue
+        try:
+            v = float(val)
+        except ValueError:
+            continue
+        # Same session key as _agg_sessions, plus zkas_claim: first/duplicate are
+        # separate series for one connection and must ADD, not max out.
+        sess = (w, wk, lb.get("ip") or "", lb.get("zkas_claim") or "")
+        if v > per_session.get(sess, 0.0):
+            per_session[sess] = v
+    for (w, wk, _ip, _claim), v in per_session.items():
+        k = (w, wk)
+        out[k] = out.get(k, 0.0) + v
+
+
 # ---- shared state, refreshed by a background sampler --------------------------
 _lock = threading.Lock()
 _state = {
     "networkHashrate": 0.0, "networkBlockCount": 0, "networkDifficulty": 0.0,
-    "activeWorkers": 0, "totalShares": 0, "totalBlocks": 0,
+    "activeWorkers": 0, "totalShares": 0, "totalBlocks": 0, "kasBlocksFound": 0,
     "bridgeUptime": 0, "workers": [], "blocks": [],
 }
 _hist = {}   # (wallet, worker) -> deque[(ts, cumulative_diff)] over WINDOW_SECS
@@ -412,12 +446,13 @@ def sample():
     if not text:
         return
 
-    diff, shares, found, mined, pending = {}, {}, {}, {}, {}
+    diff, shares, found, mined, pending, kas = {}, {}, {}, {}, {}, {}
     _agg_sessions(RX_DIFF, text, diff)
     _agg_sessions(RX_SHARES, text, shares)
     _agg_sessions(RX_FOUND, text, found)
     _agg_sessions(RX_MINED, text, mined)
     _agg_sessions(RX_PENDING, text, pending)
+    _agg_sessions_where(RX_KAS, text, kas, outcome=KAS_ACCEPTED)
 
     def _gmax(rx):
         vals = [float(v) for v in rx.findall(text)]
@@ -494,6 +529,9 @@ def sample():
             "hashrate": hr_final if b else 0.0,  # a dead session has no live rate
             "shares": int(shares.get(k, 0)) or (b["shares"] if b else 0),
             "blocks": int(found.get(k, 0)),
+            # Kaspa blocks this worker's merged parents landed. Separate from
+            # `blocks` (ZKas) because they are different chains and rewards.
+            "kasBlocks": int(kas.get(k, 0)),
             "difficulty": b["diff"] if b else None,
             "status": b["status"] if b else "offline",
             "lastSeen": b.get("lastSeen") if b else None,
@@ -516,6 +554,7 @@ def sample():
             "hashrate": b["hr"],                       # bridge rate (may be 0 = warming up)
             "shares": b["shares"],
             "blocks": int(found.get((wallet, worker), 0)),
+            "kasBlocks": int(kas.get((wallet, worker), 0)),
             "difficulty": b["diff"],
             "warmingUp": b["hr"] <= 0,
             "online": True,
@@ -575,8 +614,14 @@ def sample():
         if dnet >= BLOCKSHARE_MIN_NET and dpool >= 0:
             block_share_hs = net_hs * min(1.0, dpool / dnet)
     pool_hs = min(raw_sum_hs, net_hs) if net_hs > 0 else raw_sum_hs
-    if net_hs <= 0:                             # node fully unreachable: degrade gracefully
-        net_hs = max(raw_sum_hs, pool_hs)
+    # When the node is unreachable the network hashrate is simply UNKNOWN. It was
+    # previously filled in with `max(raw_sum_hs, pool_hs)` — the pool's own worker
+    # sum wearing the network's label, which reads as "this pool is 100% of the
+    # network" on every sample and silently understated the real figure by ~130x
+    # on a box where grpcurl was missing. A gap is honest; a fabricated number is
+    # not. 0 renders as "—" in the dashboard.
+    if net_hs <= 0:
+        net_hs = 0.0
 
     # Rescale the per-worker rates so they sum to the true pool hashrate — keeps
     # relative rig sizes but makes the workers add up to the real pool total.
@@ -598,16 +643,18 @@ def sample():
             "activeWorkers": sum(1 for w in workers if w.get("online")),
             "totalShares": total_shares,
             "totalBlocks": blocks_found,
+            "kasBlocksFound": int(sum(kas.values())),
             "bridgeUptime": int(now - START),
             "workers": workers,
             "blocks": [],
         })
         bbw = {}
-        for (w, wk) in set(list(found) + list(mined) + list(pending)):
-            d = bbw.setdefault(w, {"found": 0, "confirmed": 0, "pending": 0})
+        for (w, wk) in set(list(found) + list(mined) + list(pending) + list(kas)):
+            d = bbw.setdefault(w, {"found": 0, "confirmed": 0, "pending": 0, "kas": 0})
             d["found"] += int(found.get((w, wk), 0))
             d["confirmed"] += int(mined.get((w, wk), 0))
             d["pending"] += int(pending.get((w, wk), 0))
+            d["kas"] += int(kas.get((w, wk), 0))
         _state["_bbw"] = bbw
 
 
@@ -658,6 +705,10 @@ def redact(stats, bbw):
         "poolHashrate": pool_hashrate_hs,
         "totalBlocks": stats.get("totalBlocks"),
         "blocksAccepted": sum(v["found"] for v in bbw.values()),
+        # Kaspa blocks found by merge-mining. A separate chain and a separate
+        # reward: for miners who set a kaspa: address in the stratum password
+        # the KAS mints to them, otherwise to the pool's own payout address.
+        "kasBlocksFound": stats.get("kasBlocksFound") or 0,
         "totalShares": stats.get("totalShares"),
         "bridgeUptime": stats.get("bridgeUptime"),
         "workers": [{
@@ -666,6 +717,7 @@ def redact(stats, bbw):
             "hashrate": w.get("hashrate"),
             "shares": w.get("shares"),
             "blocks": w.get("blocks") or 0,
+            "kasBlocks": w.get("kasBlocks") or 0,
             "difficulty": w.get("difficulty"),
             "warmingUp": bool(w.get("warmingUp")),
             "status": w.get("status") or ("online" if w.get("online") else "offline"),
@@ -681,7 +733,7 @@ def redact(stats, bbw):
 def miner(address, stats, bbw):
     address = (address or "").strip()
     workers = [w for w in (stats.get("workers") or []) if w.get("wallet") == address]
-    blk = bbw.get(address, {"found": 0, "confirmed": 0, "pending": 0})
+    blk = bbw.get(address, {"found": 0, "confirmed": 0, "pending": 0, "kas": 0})
     history = payout_history(address)
     confirmed = blk["confirmed"]
     pending = blk.get("pending") or max(0, blk["found"] - confirmed)
@@ -695,6 +747,7 @@ def miner(address, stats, bbw):
             "hashrate": w.get("hashrate"),   # GH/s (0 for offline sessions)
             "shares": w.get("shares") or 0,
             "blocks": w.get("blocks") or 0,
+            "kasBlocks": w.get("kasBlocks") or 0,
             "difficulty": w.get("difficulty"),
             "warmingUp": bool(w.get("warmingUp")),
             "online": bool(w.get("online")),
@@ -706,6 +759,8 @@ def miner(address, stats, bbw):
         "totalHashrate": sum((w.get("hashrate") or 0) for w in workers if w.get("online")),  # GH/s
         "totalShares": sum((w.get("shares") or 0) for w in workers),
         "blocksFound": blk["found"],
+        # Kaspa blocks this wallet's workers landed via merged mining.
+        "kasBlocksFound": blk.get("kas", 0),
         "blocksConfirmed": confirmed,
         "blocksPending": pending,
         # Use the current consensus value for aggregate balances. Per-block
