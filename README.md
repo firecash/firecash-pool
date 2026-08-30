@@ -125,10 +125,16 @@ ZKas mining is ordinary kHeavyHash — point any Kaspa-style miner/ASIC at the p
 stratum port with your `zkas:` payout address (legacy `firecash:` accepted) as the username:
 
 ```
-stratum+tcp://<pool-host>:<port>   user=zkas:<your-address>   pass=x
+stratum+tcp://<pool-host>:<port>   user=zkas:<your-address>   pass=kaspa:<your-kas-address>
 ```
 
-(The password field is unused; `x` or empty is fine.) See [`POOL-INTEGRATION.md`](POOL-INTEGRATION.md) for the
+The password field is optional and carries your **Kaspa** payout address. Send
+a valid `kaspa:` address there and the Kaspa blocks your own shares solve pay
+you directly; send `x`, nothing, or a worker name and that reward goes to the
+pool's address instead. The address is never guessed from your username, so a
+typo is treated as absent rather than rejected.
+
+See [`POOL-INTEGRATION.md`](POOL-INTEGRATION.md) for the
 full integration guide: node setup, native vs. AuxPoW merged mining, the
 exact consensus files to read, and an error-message-to-cause table.
 
