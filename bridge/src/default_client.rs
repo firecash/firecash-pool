@@ -289,6 +289,44 @@ pub async fn handle_authorize(
         *ctx.canxium_addr.lock() = canxium_address.clone();
     }
 
+    // Merged mining: the stratum PASSWORD (`params[1]`) carries the miner's own
+    // `kaspa:` address, so a KAS block found on its lane pays the miner instead of
+    // the pool. Historically this field was ignored entirely.
+    //
+    // Parsed once, here, and stored as an `Address`. Jobs are rebuilt about once a
+    // second per connection, so bech32-decoding this on the job path would be pure
+    // repeated waste for a value that cannot change without a re-authorize.
+    //
+    // Same policy the ZKas address above uses: a miner is NEVER dropped for a bad
+    // value. Anything unparseable leaves `kas_payout = None`, which means "pay the
+    // pool" — the miner keeps mining and keeps earning ZKas normally. That is the
+    // forgiving choice, but it is also a silent one: a typo donates this miner's KAS
+    // to the pool indefinitely, so it is logged at WARN with the offending value.
+    let kas_payout = parse_kas_payout(event.params.get(1).and_then(|v| v.as_str()));
+    match &kas_payout {
+        Some(addr) => {
+            tracing::info!(
+                "[AUTHORIZE] {}:{} merged-mining KAS rewards -> {} (from password field)",
+                ctx.remote_addr,
+                ctx.remote_port,
+                addr
+            );
+        }
+        None => {
+            if let Some(raw) = event.params.get(1).and_then(|v| v.as_str())
+                && !is_placeholder_password(raw)
+            {
+                tracing::warn!(
+                    "[AUTHORIZE] {}:{} password '{}' is not a valid kaspa: address; KAS from this lane pays the POOL.                      Set the password to your kaspa: address to be paid directly.",
+                    ctx.remote_addr,
+                    ctx.remote_port,
+                    raw
+                );
+            }
+        }
+    }
+    *ctx.kas_payout.lock() = kas_payout;
+
     // Open a live `connection_session` row now that the connection has
     // authenticated (B1): the session becomes visible while still
     // connected, with its worker bound from the start, and `connected_at`
@@ -416,6 +454,57 @@ fn process_canxium_address(address: &str) -> String {
 fn pool_fallback_address() -> String {
     std::env::var("POOL_FALLBACK_ADDRESS")
         .unwrap_or_else(|_| "zkas:py82h42m9qjff0knpcmllzq3c7qhurje5auh4tq2ceagf69wjpf23djwwmqr26zhsua8rrglrwdltsh".to_string())
+}
+
+/// Passwords miners send when they mean "I have no password".
+///
+/// Every one of these is a convention, not an address, and treating them as a failed
+/// parse would spam WARN for correctly-configured miners who simply are not opting
+/// into direct KAS payout.
+fn is_placeholder_password(raw: &str) -> bool {
+    !looks_like_payout_attempt(raw)
+}
+
+/// Did this miner plausibly TRY to give us a payout address?
+///
+/// The rule is deliberately inverted: stay silent by default and warn only on a
+/// genuine attempt. Passwords in the wild are overwhelmingly conventions rather than
+/// addresses — measured on this pool within minutes of shipping the feature: `x`,
+/// `*`, `(null)`, `d=8192`, `m=solo`. Warning on "not a valid address" caught every
+/// one of those and buried the warning that actually matters — a real address with a
+/// typo, which silently donates that miner's KAS to the pool forever.
+///
+/// So: an attempt is something carrying an explicit `kaspa`-family prefix. Anything
+/// else is treated as "no opinion", pays the pool exactly as before this feature
+/// existed, and says nothing.
+fn looks_like_payout_attempt(raw: &str) -> bool {
+    let t = raw.trim().to_ascii_lowercase();
+    t.starts_with("kaspa:") || t.starts_with("kaspatest:") || t.starts_with("kaspadev:")
+}
+
+/// Read the stratum password field as the miner's KAS payout address.
+///
+/// Deliberately STRICTER than [`clean_wallet`]: that function coerces a bare payload
+/// into `kaspa:...` and falls back to a regex scrape, which is right for the ZKas
+/// address (where a wrong guess costs the miner nothing — the pool still pays them via
+/// the pool address) and wrong here. This value decides where real KAS is minted. A
+/// coerced guess that happens to decode would silently mint to an address the miner
+/// never chose and cannot spend, so anything that is not already a well-formed,
+/// explicitly-prefixed address is refused and the lane falls back to the pool.
+///
+/// Some miners send `address:worker` or `address.worker` in the password; the address
+/// is taken as the leading token so those still work.
+fn parse_kas_payout(raw: Option<&str>) -> Option<Address> {
+    let raw = raw?.trim();
+    if is_placeholder_password(raw) {
+        return None;
+    }
+    // Tolerate a trailing worker/difficulty suffix, but never invent a prefix.
+    let candidate = raw.split([',', ' ']).next().unwrap_or(raw).trim();
+    if !(candidate.starts_with("kaspa:") || candidate.starts_with("kaspatest:") || candidate.starts_with("kaspadev:")) {
+        return None;
+    }
+    Address::try_from(candidate).ok()
 }
 
 fn clean_wallet(input: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {

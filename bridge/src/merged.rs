@@ -104,6 +104,18 @@ pub fn assemble_aux_block(parent_block: &Block, fc_block: &Block) -> Block {
 /// without limit.
 pub struct MergedPending {
     map: HashMap<Hash, Block>,
+    /// Lanes whose Kaspa parent was built paying the POOL rather than the miner,
+    /// i.e. the lane was inside its pool-fee minute when the template was cut.
+    ///
+    /// Recorded at TEMPLATE-BUILD time and read back at submit time, deliberately.
+    /// The alternative — asking "are we in a fee minute?" when the share arrives —
+    /// is wrong at the boundary in both directions: a share solved against a
+    /// miner-paying template but submitted a moment after the window opens would be
+    /// reported as a pool block (miner robbed of the credit), and one solved inside
+    /// the window but submitted after it closes would be credited to the miner even
+    /// though the coinbase paid the pool (books wrong). Attribution has to follow the
+    /// template the work was actually done against, so it rides with the template.
+    fee_lane: HashSet<Hash>,
     order: VecDeque<Hash>,
     solved: HashSet<Hash>,
     cap: usize,
@@ -111,19 +123,40 @@ pub struct MergedPending {
 
 impl MergedPending {
     pub fn new(cap: usize) -> Self {
-        Self { map: HashMap::new(), order: VecDeque::new(), solved: HashSet::new(), cap: cap.max(1) }
+        Self { map: HashMap::new(), fee_lane: HashSet::new(), order: VecDeque::new(), solved: HashSet::new(), cap: cap.max(1) }
     }
 
     pub fn insert(&mut self, h_fc: Hash, fc_block: Block) {
+        self.insert_with_payee(h_fc, fc_block, false)
+    }
+
+    /// Insert, recording whether this lane's Kaspa coinbase paid the pool
+    /// (`paid_pool = true`, the fee minute) or the miner.
+    pub fn insert_with_payee(&mut self, h_fc: Hash, fc_block: Block, paid_pool: bool) {
         if self.map.insert(h_fc, fc_block).is_none() {
             self.order.push_back(h_fc);
             while self.order.len() > self.cap {
                 if let Some(old) = self.order.pop_front() {
                     self.map.remove(&old);
                     self.solved.remove(&old);
+                    self.fee_lane.remove(&old);
                 }
             }
         }
+        // Set unconditionally: a re-insert for the same H_fc must not keep a stale
+        // payee flag from an earlier template generation.
+        if paid_pool {
+            self.fee_lane.insert(h_fc);
+        } else {
+            self.fee_lane.remove(&h_fc);
+        }
+    }
+
+    /// Did the Kaspa parent for this lane pay the pool instead of the miner?
+    /// Unknown lanes answer `false` — a block we cannot attribute is credited to the
+    /// miner, never quietly to the pool.
+    pub fn paid_pool(&self, h_fc: &Hash) -> bool {
+        self.fee_lane.contains(h_fc)
     }
 
     pub fn get(&self, h_fc: &Hash) -> Option<Block> {
@@ -208,5 +241,83 @@ mod tests {
             assert!(aux.verify_coinbase_inclusion(), "branch must reproduce the root for n={n} txs");
             assert!(aux.verify_binding(h_fc), "full binding (commitment + inclusion) must hold for n={n}");
         }
+    }
+}
+
+/// How many minutes of each hour a lane's KAS rewards go to the pool instead of the
+/// miner. One in sixty ≈ 1.67%.
+pub const POOL_FEE_MINUTES_PER_HOUR: u64 = 1;
+
+/// Whether this lane is inside its pool-fee minute right now.
+///
+/// # Why the window is staggered per lane, not global
+///
+/// The obvious implementation is "minute 0 of every hour, for everyone". That makes
+/// the entire fleet switch its Kaspa coinbase at the same instant: every lane needs a
+/// fresh parent template in the same second, the pool's KAS income arrives in one
+/// lumpy burst per hour, and any bug in the switch fires fleet-wide simultaneously.
+///
+/// Hashing the lane identity spreads the fee minutes uniformly across the hour, so at
+/// any moment roughly 1/60th of the fleet is in its window, template churn is flat,
+/// and pool income is smooth. It is also stable: the same lane gets the same minute
+/// every hour, so a miner watching closely sees a predictable pattern rather than
+/// random dropouts.
+///
+/// `minute_of_hour` is passed in rather than read from a clock here so this stays a
+/// pure function and can be tested across the whole hour without waiting for one.
+pub fn is_pool_fee_minute(lane_id: u64, minute_of_hour: u64) -> bool {
+    // Cheap integer mix (splitmix64 finalizer) — this is called on the job path, and a
+    // hash here must never be a syscall or an allocation.
+    let mut z = lane_id.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let start = z % 60;
+    // Wrapping window so >1 fee minute still works if the constant is ever raised.
+    (0..POOL_FEE_MINUTES_PER_HOUR).any(|k| (start + k) % 60 == minute_of_hour)
+}
+
+#[cfg(test)]
+mod fee_window_tests {
+    use super::*;
+
+    /// Every lane must get exactly `POOL_FEE_MINUTES_PER_HOUR` fee minutes per hour —
+    /// not zero (miner never pays) and not more (miner overpays).
+    #[test]
+    fn every_lane_pays_exactly_the_configured_minutes() {
+        for lane in 0u64..500 {
+            let hits = (0..60).filter(|m| is_pool_fee_minute(lane, *m)).count() as u64;
+            assert_eq!(hits, POOL_FEE_MINUTES_PER_HOUR, "lane {lane} had {hits} fee minutes");
+        }
+    }
+
+    /// The window must be STABLE for a lane — a miner whose fee minute moved around
+    /// would see unpredictable KAS dropouts and no way to reconcile.
+    #[test]
+    fn a_lane_window_is_stable_across_calls() {
+        for lane in 0u64..100 {
+            let first: Vec<bool> = (0..60).map(|m| is_pool_fee_minute(lane, m)).collect();
+            let again: Vec<bool> = (0..60).map(|m| is_pool_fee_minute(lane, m)).collect();
+            assert_eq!(first, again, "lane {lane} window is not deterministic");
+        }
+    }
+
+    /// The whole point of staggering: lanes must not share one minute. With 600 lanes
+    /// over 60 slots a uniform spread puts ~10 per slot; assert no slot takes a
+    /// pathological share (which would recreate the fleet-wide cliff).
+    #[test]
+    fn fee_minutes_are_spread_across_the_hour() {
+        let mut per_minute = [0usize; 60];
+        for lane in 0u64..600 {
+            for m in 0..60 {
+                if is_pool_fee_minute(lane, m) {
+                    per_minute[m as usize] += 1;
+                }
+            }
+        }
+        let occupied = per_minute.iter().filter(|c| **c > 0).count();
+        assert!(occupied >= 55, "fee minutes clustered into {occupied}/60 slots");
+        let worst = per_minute.iter().copied().max().unwrap();
+        assert!(worst < 40, "one minute took {worst} of 600 lanes — not a spread");
     }
 }

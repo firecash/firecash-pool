@@ -185,7 +185,7 @@ pub fn spawn_internal_cpu_miner(
             }
 
             let generation = next_id_templates.fetch_add(1, Ordering::Relaxed);
-            match kaspa_api_templates.get_block_template(&mining_address, "internal", "", 0, generation).await {
+            match kaspa_api_templates.get_block_template(&mining_address, "internal", "", 0, generation, None, 0).await {
                 Ok(block) => {
                     let id = generation;
                     let header = block.header.clone();

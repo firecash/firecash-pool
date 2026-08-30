@@ -1,5 +1,6 @@
 use crate::jsonrpc_event::{JsonRpcEvent, JsonRpcResponse};
 use crate::log_colors::LogColors;
+use kaspa_addresses::Address;
 use hex;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -43,6 +44,16 @@ pub struct StratumContext {
     pub worker_name: Arc<Mutex<String>>,
     worker_name_supplied: Arc<AtomicBool>,
     pub canxium_addr: Arc<Mutex<String>>,
+    /// The `kaspa:` address this connection's merged-mining KAS rewards pay to,
+    /// taken from the stratum PASSWORD field at authorize (`params[1]`).
+    ///
+    /// `None` means "pay the pool" — either the miner supplied nothing, or what it
+    /// supplied did not parse. Parsed exactly once at authorize and stored as an
+    /// `Address`, never re-parsed per job: a job is built roughly once a second per
+    /// connection and bech32 decoding on that path would be pure waste.
+    ///
+    /// This does NOT affect ZKas rewards, which always pay `wallet_addr`.
+    pub kas_payout: Arc<Mutex<Option<Address>>>,
     pub remote_app: Arc<Mutex<String>>,
     pub id: Arc<Mutex<i32>>,
     pub extranonce: Arc<Mutex<String>>,
@@ -95,6 +106,7 @@ impl StratumContext {
             worker_name: Arc::new(Mutex::new(String::new())),
             worker_name_supplied: Arc::new(AtomicBool::new(false)),
             canxium_addr: Arc::new(Mutex::new(String::new())),
+            kas_payout: Arc::new(Mutex::new(None)),
             remote_app: Arc::new(Mutex::new(String::new())),
             id: Arc::new(Mutex::new(0)),
             extranonce: Arc::new(Mutex::new(String::new())),
@@ -829,6 +841,7 @@ impl Clone for StratumContext {
             worker_name: self.worker_name.clone(),
             worker_name_supplied: self.worker_name_supplied.clone(),
             canxium_addr: self.canxium_addr.clone(),
+            kas_payout: self.kas_payout.clone(),
             remote_app: self.remote_app.clone(),
             id: self.id.clone(),
             extranonce: self.extranonce.clone(),

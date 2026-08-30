@@ -420,8 +420,12 @@ impl ClientHandler {
 
             // Get block template
             let generation = client_clone.next_template_generation();
+            // Merged mining: this lane's own KAS payout (stratum password) and its
+            // lane id, which selects the one minute an hour that pays the pool.
+            let kas_payout = client_clone.kas_payout.lock().clone();
+            let lane_id = client_clone.session_uid();
             let template_result = kaspa_api_clone
-                .get_block_template(&wallet_addr, &remote_app, &canxium_addr, client_clone.session_uid(), generation)
+                .get_block_template(&wallet_addr, &remote_app, &canxium_addr, client_clone.session_uid(), generation, kas_payout, lane_id)
                 .await;
 
             let block = match template_result {
@@ -759,8 +763,10 @@ impl ClientHandler {
                 };
 
                 let generation = client_clone.next_template_generation();
+                let kas_payout = client_clone.kas_payout.lock().clone();
+                let lane_id = client_clone.session_uid();
                 let template_result = kaspa_api_clone
-                    .get_block_template(&wallet_addr, &remote_app, &canxium_addr, client_clone.session_uid(), generation)
+                    .get_block_template(&wallet_addr, &remote_app, &canxium_addr, client_clone.session_uid(), generation, kas_payout, lane_id)
                     .await;
 
                 let block = match template_result {
@@ -1032,7 +1038,11 @@ impl ClientHandler {
             let instance_id = self.instance_id.clone();
             tokio::spawn(async move {
                 let _parent_refresh_permit = parent_refresh_permit;
-                let parent = match kaspa_api.refresh_merged_parent(&old_job.block).await {
+                // A parent-only refresh must keep paying whoever the ORIGINAL template
+                // paid, or a refresh landing inside/outside the fee minute would silently
+                // move the payout mid-job. `paid_pool` is the recorded truth for this lane.
+                let refresh_payee = if kaspa_api.merged_lane_paid_pool(&old_job.block) { None } else { client.kas_payout.lock().clone() };
+                let parent = match kaspa_api.refresh_merged_parent(&old_job.block, refresh_payee).await {
                     Ok(Some(parent)) => parent,
                     Ok(None) => return,
                     Err(e) => {

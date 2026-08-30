@@ -251,7 +251,15 @@ pub struct KaspaApi {
     /// Short-lived exact-H_fc cache for duplicate requests. Solo lanes use
     /// distinct H_fc values, so fleet-wide pressure is controlled by
     /// `kaspa_parent_rpc_gate`, not by pretending all miners share one parent.
-    kaspa_parent_cache: Arc<tokio::sync::Mutex<Option<(kaspa_hashes::Hash, Block, Instant)>>>,
+    /// Keyed on `(H_fc, payee)` — BOTH parts are load-bearing.
+    ///
+    /// Keying on `H_fc` alone was safe only while every parent paid the same pool
+    /// address. Now that a lane's parent pays the miner's own `kaspa:` address, an
+    /// `H_fc` collision between two lanes would let one miner receive a cached
+    /// template minting KAS to the OTHER miner's address. Per-lane coinbase tags
+    /// should make that collision impossible, but "should" is not a good enough
+    /// argument when the failure silently redirects money, so the payee is in the key.
+    kaspa_parent_cache: Arc<tokio::sync::Mutex<Option<(kaspa_hashes::Hash, String, Block, Instant)>>>,
     /// Bound parent-template RPC concurrency. Unique solo lanes necessarily
     /// use distinct H_fc commitments, so a single global mutex would serialize
     /// the entire fleet; unbounded fan-out would overload one gRPC route.
@@ -632,15 +640,24 @@ impl KaspaApi {
     /// parent is a valid Kaspa block that both (a) can be submitted to Kaspa for KAS and
     /// (b) proves the ZKas block via AuxPoW. Errs if the Kaspa client/pay address is
     /// unset (caller falls back to a synthetic parent).
-    async fn fetch_kaspa_parent(&self, h_fc: kaspa_hashes::Hash, force: bool) -> Result<Block> {
+    ///
+    /// `payee` overrides the pool address when a miner supplied its own `kaspa:`
+    /// address in the stratum password. Passing `None` pays the pool, which is both
+    /// the legacy behaviour and the pool-fee-minute behaviour.
+    async fn fetch_kaspa_parent(&self, h_fc: kaspa_hashes::Hash, payee: Option<&Address>, force: bool) -> Result<Block> {
         let kc = self.kaspa_client.as_ref().ok_or_else(|| anyhow::anyhow!("no Kaspa node client"))?;
-        let pay = self.kaspa_pay.clone().ok_or_else(|| anyhow::anyhow!("no Kaspa pay address"))?;
+        let pay = match payee {
+            Some(a) => a.clone(),
+            None => self.kaspa_pay.clone().ok_or_else(|| anyhow::anyhow!("no Kaspa pay address"))?,
+        };
+        let pay_key = pay.to_string();
 
         {
             let cache = self.kaspa_parent_cache.lock().await;
-            if let Some((ch, parent, at)) = cache.as_ref()
+            if let Some((ch, cpay, parent, at)) = cache.as_ref()
                 && !force
                 && *ch == h_fc
+                && cpay == &pay_key
                 && at.elapsed() < KASPA_PARENT_TTL
             {
                 return Ok(parent.clone());
@@ -651,11 +668,11 @@ impl KaspaApi {
         let resp =
             kc.get_block_template_call(None, GetBlockTemplateRequest::new(pay, extra_data)).await.context("kaspa getBlockTemplate")?;
         let parent = Block::try_from(resp.block).map_err(|e| anyhow::anyhow!("kaspa block conversion: {e:?}"))?;
-        *self.kaspa_parent_cache.lock().await = Some((h_fc, parent.clone(), Instant::now()));
+        *self.kaspa_parent_cache.lock().await = Some((h_fc, pay_key, parent.clone(), Instant::now()));
         Ok(parent)
     }
 
-    pub async fn refresh_merged_parent(&self, current_parent: &Block) -> Result<Option<Block>> {
+    pub async fn refresh_merged_parent(&self, current_parent: &Block, payee: Option<&Address>) -> Result<Option<Block>> {
         if !self.merged_mining || self.kaspa_client.is_none() {
             return Ok(None);
         }
@@ -664,7 +681,7 @@ impl KaspaApi {
         if !self.pending_fc.lock().is_unsolved(&h_fc) {
             return Ok(None);
         }
-        self.fetch_kaspa_parent(h_fc, true).await.map(Some)
+        self.fetch_kaspa_parent(h_fc, payee, true).await.map(Some)
     }
 
     /// In real merged mining the parent carries the *Kaspa* target (`header.bits`), but
@@ -688,6 +705,17 @@ impl KaspaApi {
     /// the right handle for `get_current_block_color` and every block-facing
     /// stat. `None` when not merged (the job header's own hash is the chain
     /// hash) or when the parent carries no commitment.
+    /// Did this lane's Kaspa parent pay the POOL (fee minute) rather than the miner?
+    ///
+    /// Read from what was recorded when the template was built, never re-derived from
+    /// the clock — see [`crate::merged::MergedPending`].
+    pub fn merged_lane_paid_pool(&self, parent_block: &Block) -> bool {
+        match crate::merged::committed_h_fc(parent_block) {
+            Some(h) => self.pending_fc.lock().paid_pool(&h),
+            None => false,
+        }
+    }
+
     pub fn merged_chain_hash(&self, parent_block: &Block) -> Option<kaspa_hashes::Hash> {
         if !self.merged_mining {
             return None;
@@ -1100,6 +1128,10 @@ impl KaspaApi {
     }
 
     /// Get block template for a client
+    /// `kas_payout` is the lane's own `kaspa:` address from the stratum password, or
+    /// `None` to pay the pool. `lane_id` selects the lane's pool-fee minute; during
+    /// that minute the KAS coinbase pays the pool regardless of `kas_payout`. ZKas
+    /// rewards are unaffected either way — they always pay `wallet_addr`.
     pub async fn get_block_template(
         &self,
         wallet_addr: &str,
@@ -1107,6 +1139,8 @@ impl KaspaApi {
         _canxium_addr: &str,
         session_uid: u64,
         generation: u64,
+        kas_payout: Option<Address>,
+        lane_id: u64,
     ) -> Result<Block> {
         // Retry up to 3 times if we get "Odd number of digits" error
         // This error can occur if the block template has malformed hash fields
@@ -1161,7 +1195,20 @@ impl KaspaApi {
                                 // ZKas block's hash. Stash the ZKas block so a solved parent
                                 // can be turned back into an aux block in `submit_block`.
                                 let h_fc = block.header.hash;
-                                let parent = match self.fetch_kaspa_parent(h_fc, false).await {
+                                // Pool-fee minute: this lane's KAS goes to the pool for one
+                                // minute an hour. Computed ONCE here, at template-build time,
+                                // and remembered with the template — see `MergedPending`'s
+                                // `fee_lane` for why it must not be re-derived at submit time.
+                                let minute_of_hour = (std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0)
+                                    / 60)
+                                    % 60;
+                                let in_fee_minute = crate::merged::is_pool_fee_minute(lane_id, minute_of_hour);
+                                let payee = if in_fee_minute { None } else { kas_payout.as_ref() };
+                                let paid_pool = payee.is_none();
+                                let parent = match self.fetch_kaspa_parent(h_fc, payee, false).await {
                                     // Real dual-chain: a genuine Kaspa block whose coinbase commits to
                                     // H_fc — clearing its (hard) target also earns KAS.
                                     Ok(p) => p,
@@ -1176,7 +1223,7 @@ impl KaspaApi {
                                         crate::merged::build_parent_block(&block).0
                                     }
                                 };
-                                self.pending_fc.lock().insert(h_fc, block);
+                                self.pending_fc.lock().insert_with_payee(h_fc, block, paid_pool);
                                 return Ok(parent);
                             }
                             return Ok(block);
@@ -1480,8 +1527,12 @@ impl KaspaApiTrait for KaspaApi {
         KaspaApi::claim_network_solution(self, job_block)
     }
 
-    async fn refresh_merged_parent(&self, current_parent: &Block) -> Result<Option<Block>, Box<dyn std::error::Error + Send + Sync>> {
-        KaspaApi::refresh_merged_parent(self, current_parent)
+    async fn refresh_merged_parent(
+        &self,
+        current_parent: &Block,
+        payee: Option<Address>,
+    ) -> Result<Option<Block>, Box<dyn std::error::Error + Send + Sync>> {
+        KaspaApi::refresh_merged_parent(self, current_parent, payee.as_ref())
             .await
             .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)
     }
@@ -1493,8 +1544,10 @@ impl KaspaApiTrait for KaspaApi {
         _canxium_addr: &str,
         session_uid: u64,
         generation: u64,
+        kas_payout: Option<Address>,
+        lane_id: u64,
     ) -> Result<Block, Box<dyn std::error::Error + Send + Sync>> {
-        KaspaApi::get_block_template(self, wallet_addr, "", "", session_uid, generation).await.map_err(|e| {
+        KaspaApi::get_block_template(self, wallet_addr, "", "", session_uid, generation, kas_payout, lane_id).await.map_err(|e| {
             let error_msg = e.to_string();
             Box::new(std::io::Error::other(error_msg)) as Box<dyn std::error::Error + Send + Sync>
         })
