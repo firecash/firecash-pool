@@ -215,9 +215,10 @@ async fn submit_parent_then_claim_zkas<T: KaspaApiTrait + ?Sized>(
     kaspa_api: &T,
     solved_parent: &Block,
     job_parent: &Block,
+    clears_zkas: bool,
 ) -> (crate::kaspaapi::MergedParentSubmitOutcome, bool) {
     let parent_outcome = kaspa_api.submit_merged_parent_if_solved(solved_parent).await;
-    let claimed_zkas = kaspa_api.claim_network_solution(job_parent);
+    let claimed_zkas = clears_zkas && kaspa_api.claim_network_solution(job_parent);
     (parent_outcome, claimed_zkas)
 }
 
@@ -888,7 +889,7 @@ impl ShareHandler {
             // Go code compares: powValue.Cmp(&powState.Target) <= 0 where Target is network target from header.bits
             // We calculate network_target directly from current job's header.bits (not from stored state)
             // This ensures we use the correct target for each job, as different jobs may have different header.bits
-            if meets_network_target {
+            if meets_network_target || (merged_mode && check_passed) {
                 let wallet_addr = ctx.wallet_addr.lock().clone();
                 let worker_name = ctx.effective_worker_name();
                 let prefix = self.log_prefix();
@@ -904,9 +905,23 @@ impl ShareHandler {
                 let transactions_vec = current_job.block.transactions.iter().cloned().collect();
                 let block = Block::from_arcs(Arc::new(header_clone), Arc::new(transactions_vec));
 
-                let (parent_outcome, claimed_zkas) =
-                    submit_parent_then_claim_zkas(kaspa_api.as_ref(), &block, &current_job.block).await;
+                let (parent_outcome, claimed_zkas) = submit_parent_then_claim_zkas(
+                    kaspa_api.as_ref(),
+                    &block,
+                    &current_job.block,
+                    meets_network_target,
+                )
+                .await;
                 crate::prom::record_merged_parent_submit(&self.worker_prom_context(&ctx, ""), &parent_outcome, claimed_zkas);
+
+                // The two chain targets are independent. If this nonce clears
+                // only the Kaspa parent target, its KAS block has already been
+                // submitted and recorded above. Credit the Stratum share but do
+                // not claim or submit a ZKAS block it did not solve.
+                if !meets_network_target {
+                    invalid_share = false;
+                    break;
+                }
 
                 // In merged mode many distinct parent nonces can prove the same
                 // fixed ZKAS `H_fc`, but that ZKAS block can pay only once.
@@ -1995,6 +2010,10 @@ pub trait KaspaApiTrait: Send + Sync {
         canxium_addr: &str,
         session_uid: u64,
         generation: u64,
+        // `kas_payout`: the lane's own `kaspa:` payout from the stratum password;
+        // `None` pays the pool. `lane_id`: selects the lane's pool-fee minute.
+        kas_payout: Option<kaspa_addresses::Address>,
+        lane_id: u64,
     ) -> Result<Block, Box<dyn std::error::Error + Send + Sync>>;
 
     async fn submit_block(
@@ -2021,6 +2040,11 @@ pub trait KaspaApiTrait: Send + Sync {
     /// Real merged mining: the ZKas (easier) block-found target for a given parent,
     /// or `None` when not merged / the parent is unknown (caller then uses the parent's
     /// own `header.bits`). Default `None` keeps non-KaspaApi impls (mocks) unaffected.
+    /// Whether this lane's Kaspa parent paid the pool (fee minute). Mocks say no.
+    fn merged_lane_paid_pool(&self, _parent_block: &Block) -> bool {
+        false
+    }
+
     fn merged_fc_target(&self, _parent_block: &Block) -> Option<num_bigint::BigUint> {
         None
     }
@@ -2042,7 +2066,11 @@ pub trait KaspaApiTrait: Send + Sync {
         true
     }
 
-    async fn refresh_merged_parent(&self, _current_parent: &Block) -> Result<Option<Block>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn refresh_merged_parent(
+        &self,
+        _current_parent: &Block,
+        _payee: Option<kaspa_addresses::Address>,
+    ) -> Result<Option<Block>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(None)
     }
 }
@@ -2068,6 +2096,8 @@ mod merged_settlement_order_tests {
             _canxium_addr: &str,
             _session_uid: u64,
             _generation: u64,
+            _kas_payout: Option<kaspa_addresses::Address>,
+            _lane_id: u64,
         ) -> Result<Block, Box<dyn std::error::Error + Send + Sync>> {
             unreachable!("template fetch is outside this regression")
         }
@@ -2103,11 +2133,27 @@ mod merged_settlement_order_tests {
         let parent = Block::new(Header::from_precomputed_hash(Hash::from_bytes([7; 32]), vec![]), vec![]);
         let api = AlreadyClaimedApi { calls: Mutex::new(vec![]) };
 
-        let (outcome, claimed_zkas) = submit_parent_then_claim_zkas(&api, &parent, &parent).await;
+        let (outcome, claimed_zkas) = submit_parent_then_claim_zkas(&api, &parent, &parent, true).await;
 
         assert_eq!(outcome, MergedParentSubmitOutcome::Accepted);
         assert!(!claimed_zkas, "fixture represents an H_fc already claimed by an earlier nonce");
         assert_eq!(api.calls.lock().as_slice(), ["parent", "claim"], "Kaspa submission must never be gated behind ZKAS deduplication");
+    }
+
+    /// The crossover regression: once ZKas difficulty passes Kaspa's, a nonce can
+    /// clear the Kaspa parent while failing the ZKas target. Its KAS block must
+    /// still be submitted, and it must NOT consume the ZKas H_fc claim — burning
+    /// that would stop a later, genuinely ZKas-clearing nonce from ever minting it.
+    #[tokio::test]
+    async fn kas_only_solution_never_claims_zkas() {
+        let parent = Block::new(Header::from_precomputed_hash(Hash::from_bytes([8; 32]), vec![]), vec![]);
+        let api = AlreadyClaimedApi { calls: Mutex::new(vec![]) };
+
+        let (outcome, claimed_zkas) = submit_parent_then_claim_zkas(&api, &parent, &parent, false).await;
+
+        assert_eq!(outcome, MergedParentSubmitOutcome::Accepted);
+        assert!(!claimed_zkas);
+        assert_eq!(api.calls.lock().as_slice(), ["parent"], "KAS-only work must not consume the ZKAS H_fc claim");
     }
 }
 
