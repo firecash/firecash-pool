@@ -10,6 +10,47 @@ backward-incompatible ways at every minor bump.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-30
+
+First tagged release. The pool has been serving production since 2026-08-24;
+this captures that tree, including work that had been deployed but never
+committed.
+
+### Added
+
+- **Per-miner KAS payout via the stratum password field.** A merge-mining lane
+  can pay its KAS to the miner instead of the pool: set the stratum password to
+  your own `kaspa:` address. Anything without an explicit
+  `kaspa:`/`kaspatest:`/`kaspadev:` prefix is treated as "no opinion" and the
+  lane keeps paying the pool, so placeholder passwords (`x`, `*`, `(null)`,
+  `d=8192`) stay silent instead of warning. Parsing is deliberately stricter
+  than the ZKas address path — it never coerces a bare payload, because a
+  coerced guess that happened to decode would mint real KAS to an address the
+  miner cannot spend (`bridge/src/default_client.rs`).
+- **KAS block statistics.** Pool-wide `kasBlocksFound`, a per-worker `kasBlocks`
+  column, and per-wallet `kasBlocksFound` in the miner lookup. The data was
+  already in `ks_merged_parent_submit_total` and simply never read
+  (`pool-redactor.py`).
+
+### Fixed
+
+- **Kaspa-clearing solutions are no longer gated behind the ZKas target.** The
+  Kaspa submit sat inside `if meets_network_target`, which is harmless only
+  while Kaspa is the harder chain. That inverts once ZKas difficulty passes
+  Kaspa's: a hash in the band `zkas_target < h <= kaspa_target` wins a real
+  Kaspa block and was discarded for failing an unrelated chain's test —
+  silently, with no rejection and no metric. Measured margin fell from 1.34 to
+  1.136 within a single day; at 2x today's ZKas difficulty the loss would be
+  ~43% of all KAS. Both targets are now evaluated independently, and a
+  Kaspa-only nonce never consumes the ZKas `H_fc` claim
+  (`bridge/src/share_handler.rs`).
+- **Dashboard no longer reports the pool's own hashrate as the network's.** When
+  the node was unreachable the network figure was filled in with
+  `max(raw_sum_hs, pool_hs)` — the pool's worker sum wearing the network's
+  label. On a host missing `grpcurl` this read as "100% of the network" on every
+  sample and understated the real figure ~130x. Unknown is now left unknown
+  (`pool-redactor.py`).
+
 ### Fixed
 
 - **Dashboard "Block height" showed a stale/low value** (~115K while the chain
