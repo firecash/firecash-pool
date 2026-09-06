@@ -1398,12 +1398,15 @@ mod comprehensive_tests {
 
     #[tokio::test]
     async fn test_stratum_protocol_subscribe_bitmain_no_extranonce() {
-        // Test: Bitmain miners don't get extranonce (extranonce_size=0)
-        // This demonstrates miner-specific handling
+        // Test: a Bitmain miner on a listener configured with the default 2-byte
+        // width still gets a per-connection prefix, for duplicate-work protection.
+        // The width argument is the listener's configured one and is now honoured,
+        // so it must be the default here -- passing 0 and expecting a prefix only
+        // held while the assignment path ignored the value.
 
         let share_handler = Arc::new(ShareHandler::new("test-instance".to_string()));
         let client_handler =
-            Arc::new(ClientHandler::new(share_handler, 8192.0, std::collections::HashMap::new(), 0, "test-instance".to_string()));
+            Arc::new(ClientHandler::new(share_handler, 8192.0, std::collections::HashMap::new(), 2, "test-instance".to_string()));
 
         let ctx = create_test_context().await;
         let event = JsonRpcEvent::new(Some("1".to_string()), "mining.subscribe", vec![json!("GodMiner")]);
@@ -1443,10 +1446,11 @@ mod comprehensive_tests {
 
     #[test]
     fn test_miner_type_detection_bitmain() {
-        // Test: Bitmain miner detection with duplicate-work protection.
+        // Test: Bitmain miner detection with duplicate-work protection, on a
+        // listener using the default 2-byte width.
         let share_handler = Arc::new(ShareHandler::new("test-instance".to_string()));
         let client_handler =
-            Arc::new(ClientHandler::new(share_handler, 8192.0, std::collections::HashMap::new(), 0, "test-instance".to_string()));
+            Arc::new(ClientHandler::new(share_handler, 8192.0, std::collections::HashMap::new(), 2, "test-instance".to_string()));
 
         let ctx = create_test_context_sync();
         *ctx.remote_app.lock() = "GodMiner".to_string();
@@ -1454,6 +1458,40 @@ mod comprehensive_tests {
 
         let extranonce = ctx.extranonce.lock().clone();
         assert!(!extranonce.is_empty(), "Bitmain should get extranonce");
+    }
+
+    /// A listener configured for no prefix hands out none. This is what the
+    /// config has always claimed and never did: the assignment path hardcoded two
+    /// bytes, so `extranonce_size` was dead and an operator could not narrow the
+    /// prefix for a rented proxy that needs the nonce space.
+    #[test]
+    fn a_zero_width_listener_hands_out_no_prefix() {
+        let share_handler = Arc::new(ShareHandler::new("test-instance".to_string()));
+        let client_handler =
+            Arc::new(ClientHandler::new(share_handler, 8192.0, std::collections::HashMap::new(), 0, "test-instance".to_string()));
+
+        let ctx = create_test_context_sync();
+        *ctx.remote_app.lock() = "BzMiner".to_string();
+        client_handler.assign_extranonce_for_miner(&ctx, "BzMiner");
+
+        assert!(ctx.extranonce.lock().is_empty(), "width 0 must yield no prefix");
+    }
+
+    /// A one-byte listener -- what a rental proxy needs -- yields exactly one byte,
+    /// leaving the proxy seven of the eight nonce bytes to split across its rigs.
+    #[test]
+    fn a_one_byte_listener_leaves_the_miner_seven_bytes() {
+        let share_handler = Arc::new(ShareHandler::new("test-instance".to_string()));
+        let client_handler =
+            Arc::new(ClientHandler::new(share_handler, 8192.0, std::collections::HashMap::new(), 1, "test-instance".to_string()));
+
+        let ctx = create_test_context_sync();
+        *ctx.remote_app.lock() = "NiceHash".to_string();
+        client_handler.assign_extranonce_for_miner(&ctx, "NiceHash");
+
+        let extranonce = ctx.extranonce.lock().clone();
+        assert_eq!(extranonce.len(), 2, "1-byte prefix must be 2 hex chars, got {extranonce:?}");
+        assert_eq!(8 - extranonce.len() / 2, 7, "miner must be left 7 nonce bytes");
     }
 
     #[test]

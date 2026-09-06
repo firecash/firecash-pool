@@ -82,3 +82,24 @@ instances:
     # Optional: instance-specific overrides
     # var_diff: true
     # shares_per_min: 30
+
+  # NiceHash / rented hashpower — narrow nonce prefix.
+  #
+  # A rental proxy multiplexes many rigs behind ONE pool connection, so it has to
+  # subdivide whatever nonce space the pool leaves it. Kaspa's nonce is 8 bytes and
+  # the pool's prefix comes off the front, so the 2-byte prefix used by the other
+  # ports leaves only 6 bytes (2^48). A single 100 TH/s rented rig walks 2^48 in
+  # about three seconds, and a proxy has to split that across many rigs at once --
+  # which is why NiceHash wants the pool's prefix kept to one byte, leaving it 7.
+  #
+  # Deliberately a separate listener rather than a change to :5555 / :5577: those
+  # work today for direct miners and MRR, and their prefix width is unchanged.
+  # Fixed difficulty for the same reason :5577 is fixed -- an intervening proxy
+  # should see a stable target rather than a moving one.
+  - stratum_port: ":5511"
+    min_share_diff: 8192
+    prom_port: ":2118"
+    var_diff: false
+    shares_per_min: 20
+    extranonce_size: 1
+    log_to_file: false

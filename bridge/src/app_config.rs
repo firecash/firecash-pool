@@ -214,7 +214,10 @@ impl Default for GlobalConfig {
             var_diff: true,
             shares_per_min: 20,
             var_diff_stats: false,
-            extranonce_size: 0,
+            // 2 bytes, matching what the assignment path hardcoded before it was
+            // made configurable. Defaulting to 0 here would silently drop every
+            // deployment that omits the key from a 2-byte prefix to none.
+            extranonce_size: 2,
             pow2_clamp: false,
             coinbase_tag_suffix: None,
         }

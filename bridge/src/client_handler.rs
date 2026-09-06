@@ -42,7 +42,76 @@ static BIG_JOB_REGEX: once_cell::sync::Lazy<Regex> =
 const BALANCE_DELAY: Duration = Duration::from_secs(60);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(20);
 
-static GLOBAL_NEXT_EXTRANONCE: AtomicI32 = AtomicI32::new(0);
+/// One rotating prefix counter per extranonce width (index = width in bytes).
+///
+/// A single shared counter is wrong as soon as two ports use different widths: a
+/// 1-byte port wraps at 255 and resets the shared value, after which a 2-byte port
+/// re-issues prefixes it has already handed to connected miners and puts two rigs
+/// on the same nonce space. Keeping one counter per width makes each port's
+/// rotation independent, so adding a narrow port cannot disturb a wide one.
+static NEXT_EXTRANONCE: [AtomicI32; 4] =
+    [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+
+/// Hand out the next nonce prefix of `width` bytes.
+///
+/// Returns the hex string, the numeric value, and whether the counter wrapped.
+/// Split out from the assignment path so the property that matters can actually be
+/// tested: each width rotates on its own counter, so a narrow port cannot reset a
+/// wide one and hand two connected rigs the same nonce space.
+fn next_extranonce_prefix(width: u8) -> (String, i32, bool) {
+    let width = width.clamp(1, 3);
+    let max_extranonce = (2_f64.powi(8 * i32::from(width)) - 1.0) as i32;
+    let next = NEXT_EXTRANONCE[width as usize]
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| if val < max_extranonce { Some(val + 1) } else { Some(0) });
+    let wrapped = next.is_err() || next.unwrap_or(0) >= max_extranonce;
+    let value = next.unwrap_or(0);
+    (format!("{:0hex$x}", value, hex = (width as usize) * 2), value, wrapped)
+}
+
+#[cfg(test)]
+mod extranonce_width_tests {
+    use super::*;
+
+    /// The width the pool has always handed out. A 2-byte prefix is four hex
+    /// characters and leaves the miner six of the eight nonce bytes.
+    #[test]
+    fn two_bytes_is_four_hex_chars() {
+        let (hex, _, _) = next_extranonce_prefix(2);
+        assert_eq!(hex.len(), 4, "2-byte prefix must be 4 hex chars, got {hex:?}");
+    }
+
+    /// What a rented proxy needs: one byte, leaving it seven to split.
+    #[test]
+    fn one_byte_is_two_hex_chars() {
+        let (hex, _, _) = next_extranonce_prefix(1);
+        assert_eq!(hex.len(), 2, "1-byte prefix must be 2 hex chars, got {hex:?}");
+    }
+
+    /// The reason the counters are per-width. Exhausting the 1-byte space wraps it
+    /// back to zero; if the 2-byte port shared that counter it would then re-issue
+    /// prefixes already held by connected miners, putting two rigs on one nonce
+    /// space. Running a full 1-byte rotation must leave the 2-byte port advancing
+    /// from where it was.
+    #[test]
+    fn wrapping_a_narrow_width_does_not_reset_a_wide_one() {
+        let (_, before, _) = next_extranonce_prefix(2);
+        for _ in 0..600 {
+            let _ = next_extranonce_prefix(1);
+        }
+        let (_, after, _) = next_extranonce_prefix(2);
+        assert!(after > before, "2-byte counter went backwards: {before} -> {after}");
+    }
+
+    /// A width-1 prefix never exceeds one byte even as the counter climbs.
+    #[test]
+    fn a_narrow_prefix_never_widens() {
+        for _ in 0..300 {
+            let (hex, value, _) = next_extranonce_prefix(1);
+            assert_eq!(hex.len(), 2, "prefix widened to {hex:?}");
+            assert!(value <= 0xFF, "value {value} escaped one byte");
+        }
+    }
+}
 
 fn parent_job_interval(remote_app: &str) -> Duration {
     let app = remote_app.to_ascii_lowercase();
@@ -63,7 +132,8 @@ pub struct ClientHandler {
     /// local (listening) port selects the *initial* difficulty only;
     /// vardiff then moves freely from there. Empty in single-port mode.
     port_seeds: HashMap<u16, f64>,
-    _extranonce_size: i8, // Kept for backward compatibility, but now auto-detected per client
+    /// Width in bytes of the nonce prefix this listener hands out (0-3).
+    extranonce_size: i8,
     _max_extranonce: i32, // Kept for backward compatibility
     last_template_time: Arc<Mutex<Instant>>,
     last_balance_check: Arc<Mutex<Instant>>,
@@ -133,7 +203,7 @@ impl ClientHandler {
             client_counter: AtomicI32::new(0),
             min_share_diff,
             port_seeds,
-            _extranonce_size: extranonce_size,
+            extranonce_size,
             _max_extranonce: max_extranonce,
             last_template_time: Arc::new(Mutex::new(Instant::now())),
             last_balance_check: Arc::new(Mutex::new(Instant::now())),
@@ -257,21 +327,20 @@ impl ClientHandler {
             .map(|v| v != "0")
             .unwrap_or(true);
 
-        let required_extranonce_size = if is_bitmain && !bitmain_extranonce_enabled { 0 } else { 2 };
+        // Width comes from this listener's config. It was hardcoded to 2, which made
+        // `extranonce_size` in the config file dead: a rented proxy such as NiceHash
+        // needs the pool's prefix to stay narrow so it has enough of the 8-byte nonce
+        // left to split across the rigs behind it, and no config value could express
+        // that. The default is still 2, so every existing port keeps its behaviour.
+        let configured_extranonce_size = self.extranonce_size.clamp(0, 3);
+        let required_extranonce_size =
+            if is_bitmain && !bitmain_extranonce_enabled { 0 } else { configured_extranonce_size };
 
         let extranonce = if required_extranonce_size > 0 {
-            // Calculate max extranonce for size 2
-            let max_extranonce = (2_f64.powi(16) - 1.0) as i32; // 2 bytes = 16 bits = 65535
-
-            let next = GLOBAL_NEXT_EXTRANONCE
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| if val < max_extranonce { Some(val + 1) } else { Some(0) });
-
-            if next.is_err() || next.unwrap() >= max_extranonce {
+            let (extranonce_str, extranonce_val, wrapped) = next_extranonce_prefix(required_extranonce_size as u8);
+            if wrapped {
                 warn!("wrapped extranonce! new clients may be duplicating work...");
             }
-
-            let extranonce_val = next.unwrap_or(0);
-            let extranonce_str = format!("{:0width$x}", extranonce_val, width = (required_extranonce_size * 2) as usize);
             debug!(
                 "[AUTO-EXTRANONCE] Assigned extranonce '{}' (value: {}, size: {} bytes) to {} miner '{}'",
                 extranonce_str,
