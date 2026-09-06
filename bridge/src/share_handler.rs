@@ -912,7 +912,16 @@ impl ShareHandler {
                     meets_network_target,
                 )
                 .await;
-                crate::prom::record_merged_parent_submit(&self.worker_prom_context(&ctx, ""), &parent_outcome, claimed_zkas);
+                // Who the KAS actually minted to, taken from the lane's recorded
+                // truth rather than re-derived: the miner set no `kaspa:` address,
+                // or this was its pool-fee minute.
+                let paid_pool = kaspa_api.merged_lane_paid_pool(&block);
+                crate::prom::record_merged_parent_submit(
+                    &self.worker_prom_context(&ctx, ""),
+                    &parent_outcome,
+                    claimed_zkas,
+                    paid_pool,
+                );
 
                 // The two chain targets are independent. If this nonce clears
                 // only the Kaspa parent target, its KAS block has already been

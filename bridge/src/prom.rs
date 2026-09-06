@@ -60,6 +60,9 @@ static JOB_COUNTER: OnceLock<CounterVec> = OnceLock::new();
 
 /// Balance gauge - wallet balance for connected workers
 static BALANCE_GAUGE: OnceLock<GaugeVec> = OnceLock::new();
+/// 1 when the worker supplied a usable `kaspa:` payout address, 0 when its
+/// merge-mined KAS mints to the pool instead.
+static KAS_PAYOUT_SET_GAUGE: OnceLock<GaugeVec> = OnceLock::new();
 
 /// Error counter - errors by worker
 static ERROR_BY_WALLET: OnceLock<CounterVec> = OnceLock::new();
@@ -154,6 +157,15 @@ pub fn init_metrics() {
         .unwrap()
     });
 
+    KAS_PAYOUT_SET_GAUGE.get_or_init(|| {
+        register_gauge_vec!(
+            "ks_worker_kas_payout_set",
+            "1 when the worker supplied a usable kaspa: payout address, 0 when its merge-mined KAS mints to the pool",
+            WORKER_LABELS
+        )
+        .unwrap()
+    });
+
     BLOCK_NOT_CONFIRMED_BLUE_COUNTER.get_or_init(|| {
         register_counter_vec!(
             "ks_blocks_not_confirmed_blue",
@@ -166,8 +178,8 @@ pub fn init_metrics() {
     MERGED_PARENT_SUBMIT_COUNTER.get_or_init(|| {
         register_counter_vec!(
             "ks_merged_parent_submit_total",
-            "Independent Kaspa parent submission outcomes, including whether the same solution won the ZKAS claim",
-            &["instance", "worker", "wallet", "outcome", "zkas_claim"]
+            "Independent Kaspa parent submission outcomes, including whether the same solution won the ZKAS claim and who the KAS was minted to",
+            &["instance", "worker", "wallet", "outcome", "zkas_claim", "kas_payout"]
         )
         .unwrap()
     });
@@ -663,7 +675,10 @@ impl WorkerContext {
             worker_name: worker_name.to_string(),
             miner: miner.to_string(),
             wallet: ctx.wallet_addr.lock().clone(),
-            ip: format!("{}:{}", ctx.remote_addr(), ctx.remote_port()),
+            // Address only -- never the ephemeral source port. The port makes every
+            // reconnect a brand-new, permanent time series, and nothing ever removes
+            // them: 307 workers had grown 267k series and 1.7 GB of RSS.
+            ip: ctx.remote_addr().to_string(),
         }
     }
 }
@@ -675,7 +690,10 @@ pub fn worker_context(instance_id: &str, ctx: &crate::stratum_context::StratumCo
         worker_name: ctx.effective_worker_name(),
         miner: miner.into(),
         wallet: ctx.wallet_addr.lock().clone(),
-        ip: format!("{}:{}", ctx.remote_addr(), ctx.remote_port()),
+        // Address only -- never the ephemeral source port. The port makes every
+            // reconnect a brand-new, permanent time series, and nothing ever removes
+            // them: 307 workers had grown 267k series and 1.7 GB of RSS.
+            ip: ctx.remote_addr().to_string(),
     }
 }
 
@@ -685,7 +703,19 @@ pub fn record_block_accepted_by_node(worker: &WorkerContext) {
     }
 }
 
-pub fn record_merged_parent_submit(worker: &WorkerContext, outcome: &crate::kaspaapi::MergedParentSubmitOutcome, claimed_zkas: bool) {
+/// Record a Kaspa parent submission.
+///
+/// `paid_pool` is the recorded truth for the lane that produced this parent: the
+/// KAS coinbase paid the pool (the miner set no `kaspa:` address, or this was its
+/// pool-fee minute) rather than the miner. Without it the counter cannot say who
+/// the KAS actually went to, and a miner who never configured a payout address is
+/// shown blocks it earned nothing from.
+pub fn record_merged_parent_submit(
+    worker: &WorkerContext,
+    outcome: &crate::kaspaapi::MergedParentSubmitOutcome,
+    claimed_zkas: bool,
+    paid_pool: bool,
+) {
     if matches!(
         outcome,
         crate::kaspaapi::MergedParentSubmitOutcome::NotMerged | crate::kaspaapi::MergedParentSubmitOutcome::DoesNotClearKaspa
@@ -694,6 +724,7 @@ pub fn record_merged_parent_submit(worker: &WorkerContext, outcome: &crate::kasp
     }
     if let Some(counter) = MERGED_PARENT_SUBMIT_COUNTER.get() {
         let zkas_claim = if claimed_zkas { "first" } else { "duplicate" };
+        let kas_payout = if paid_pool { "pool" } else { "miner" };
         counter
             .with_label_values(&[
                 worker.instance_id.as_str(),
@@ -701,8 +732,18 @@ pub fn record_merged_parent_submit(worker: &WorkerContext, outcome: &crate::kasp
                 worker.wallet.as_str(),
                 outcome.metric_label(),
                 zkas_claim,
+                kas_payout,
             ])
             .inc();
+    }
+}
+
+/// Whether this worker currently has a usable `kaspa:` payout address (`1`) or its
+/// merge-mined KAS mints to the pool (`0`). Exposed so the dashboard can say "not
+/// set" instead of showing a block count the miner was never paid for.
+pub fn record_kas_payout_configured(worker: &WorkerContext, configured: bool) {
+    if let Some(gauge) = KAS_PAYOUT_SET_GAUGE.get() {
+        gauge.with_label_values(&worker.labels()).set(if configured { 1.0 } else { 0.0 });
     }
 }
 

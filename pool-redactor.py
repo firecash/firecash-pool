@@ -58,6 +58,13 @@ RX_FOUND = _rx("ks_blocks_accepted_by_node")    # blocks found per worker
 RX_MINED = _rx("ks_blocks_mined")               # confirmed/paid per worker
 RX_PENDING = _rx("ks_blocks_not_confirmed_blue")  # maturing per worker
 RX_KAS = _rx("ks_merged_parent_submit_total")   # merged parents Kaspa ACCEPTED, per worker
+RX_KAS_SET = _rx("ks_worker_kas_payout_set")    # 1 = worker supplied a usable kaspa: address
+
+# Who the KAS coinbase actually paid. A miner that never set a `kaspa:` address,
+# or that was in its pool-fee minute, earned nothing from the block -- crediting
+# it on the dashboard reads as "you were paid" and generates support questions.
+KAS_TO_MINER = "miner"
+KAS_TO_POOL = "pool"
 # Only this outcome is a Kaspa block that landed. The bridge never emits the
 # counter for parents that failed to clear Kaspa's target (see
 # `record_merged_parent_submit`), so "accepted" is the whole story; `zkas_claim`
@@ -190,10 +197,10 @@ def _agg_sessions_where(rx, text, out, **want):
             continue
         # Same session key as _agg_sessions, plus zkas_claim: first/duplicate are
         # separate series for one connection and must ADD, not max out.
-        sess = (w, wk, lb.get("ip") or "", lb.get("zkas_claim") or "")
+        sess = (w, wk, lb.get("ip") or "", lb.get("zkas_claim") or "", lb.get("kas_payout") or "")
         if v > per_session.get(sess, 0.0):
             per_session[sess] = v
-    for (w, wk, _ip, _claim), v in per_session.items():
+    for (w, wk, _ip, _claim, _payout), v in per_session.items():
         k = (w, wk)
         out[k] = out.get(k, 0.0) + v
 
@@ -263,8 +270,12 @@ def current_miner_reward():
 # the delta. The file is tiny and is written atomically.
 LIFETIME_TOTALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     "redactor-lifetime-totals.json")
-_lifetime = {"totalShares": 0, "totalBlocks": 0,
-             "rawShares": 0, "rawBlocks": 0, "savedAt": 0}
+# `totalKas` is the pool's lifetime merge-mined KAS block count. It is tracked the
+# same monotonic way as shares/blocks because a bridge restart zeroes every
+# Prometheus counter, and a headline that falls from 21,715 to 0 reads as lost
+# blocks. `rawKas` is the last raw counter value seen, used to detect that reset.
+_lifetime = {"totalShares": 0, "totalBlocks": 0, "totalKas": 0,
+             "rawShares": 0, "rawBlocks": 0, "rawKas": 0, "savedAt": 0}
 _lifetime_last_save = 0.0
 
 
@@ -279,19 +290,24 @@ def _lifetime_load():
         pass
 
 
-def _lifetime_update(raw_shares, raw_blocks):
-    """Return monotonic (shares, blocks) across bridge and redactor restarts."""
+def _lifetime_update(raw_shares, raw_blocks, raw_kas=0):
+    """Return monotonic (shares, blocks, kas) across bridge and redactor restarts."""
     global _lifetime_last_save
     raw_shares, raw_blocks = max(0, int(raw_shares)), max(0, int(raw_blocks))
+    raw_kas = max(0, int(raw_kas))
     previous_shares, previous_blocks = _lifetime["rawShares"], _lifetime["rawBlocks"]
+    previous_kas = _lifetime["rawKas"]
     share_delta = raw_shares if raw_shares < previous_shares else raw_shares - previous_shares
     block_delta = raw_blocks if raw_blocks < previous_blocks else raw_blocks - previous_blocks
+    kas_delta = raw_kas if raw_kas < previous_kas else raw_kas - previous_kas
     _lifetime["totalShares"] += share_delta
     _lifetime["totalBlocks"] += block_delta
+    _lifetime["totalKas"] += kas_delta
     _lifetime["rawShares"], _lifetime["rawBlocks"] = raw_shares, raw_blocks
+    _lifetime["rawKas"] = raw_kas
 
     now = time.time()
-    if block_delta or now - _lifetime_last_save >= 30:
+    if block_delta or kas_delta or now - _lifetime_last_save >= 30:
         _lifetime["savedAt"] = int(now)
         tmp = LIFETIME_TOTALS_FILE + ".tmp"
         try:
@@ -301,7 +317,7 @@ def _lifetime_update(raw_shares, raw_blocks):
             _lifetime_last_save = now
         except Exception:
             pass
-    return _lifetime["totalShares"], _lifetime["totalBlocks"]
+    return _lifetime["totalShares"], _lifetime["totalBlocks"], _lifetime["totalKas"]
 
 
 def _payouts_load():
@@ -446,13 +462,33 @@ def sample():
     if not text:
         return
 
-    diff, shares, found, mined, pending, kas = {}, {}, {}, {}, {}, {}
+    diff, shares, found, mined, pending, kas, kas_pool = {}, {}, {}, {}, {}, {}, {}
     _agg_sessions(RX_DIFF, text, diff)
     _agg_sessions(RX_SHARES, text, shares)
     _agg_sessions(RX_FOUND, text, found)
     _agg_sessions(RX_MINED, text, mined)
     _agg_sessions(RX_PENDING, text, pending)
-    _agg_sessions_where(RX_KAS, text, kas, outcome=KAS_ACCEPTED)
+    # `kas` is only what the MINER was paid. Pool-paid parents are counted
+    # separately: they are the pool's revenue, not the miner's. A series with no
+    # `kas_payout` label at all is from a pre-upgrade bridge; it is left out of
+    # the miner's total rather than guessed at, because over-crediting is the
+    # failure mode that misleads.
+    _agg_sessions_where(RX_KAS, text, kas, outcome=KAS_ACCEPTED, kas_payout=KAS_TO_MINER)
+    _agg_sessions_where(RX_KAS, text, kas_pool, outcome=KAS_ACCEPTED, kas_payout=KAS_TO_POOL)
+
+    # Which workers currently have a usable kaspa: payout address.
+    kas_set = {}
+    for labels, val in RX_KAS_SET.findall(text):
+        lb = _labels(labels)
+        w, wk = lb.get("wallet"), lb.get("worker")
+        if not w:
+            continue
+        try:
+            v = float(val)
+        except ValueError:
+            continue
+        key = (w, wk)
+        kas_set[key] = kas_set.get(key, 0.0) or v
 
     def _gmax(rx):
         vals = [float(v) for v in rx.findall(text)]
@@ -529,9 +565,12 @@ def sample():
             "hashrate": hr_final if b else 0.0,  # a dead session has no live rate
             "shares": int(shares.get(k, 0)) or (b["shares"] if b else 0),
             "blocks": int(found.get(k, 0)),
-            # Kaspa blocks this worker's merged parents landed. Separate from
-            # `blocks` (ZKas) because they are different chains and rewards.
+            # Kaspa blocks this worker's merged parents landed AND was paid for.
+            # Separate from `blocks` (ZKas): different chains, different rewards.
             "kasBlocks": int(kas.get(k, 0)),
+            # False => this worker set no usable kaspa: address, so its KAS mints
+            # to the pool. The dashboard shows "not set" instead of a count.
+            "kasPayoutSet": bool(kas_set.get(k, 0.0)),
             "difficulty": b["diff"] if b else None,
             "status": b["status"] if b else "offline",
             "lastSeen": b.get("lastSeen") if b else None,
@@ -555,6 +594,7 @@ def sample():
             "shares": b["shares"],
             "blocks": int(found.get((wallet, worker), 0)),
             "kasBlocks": int(kas.get((wallet, worker), 0)),
+            "kasPayoutSet": bool(kas_set.get((wallet, worker), 0.0)),
             "difficulty": b["diff"],
             "warmingUp": b["hr"] <= 0,
             "online": True,
@@ -576,7 +616,8 @@ def sample():
 
     raw_shares = int(sum(shares.values()))
     raw_blocks_found = int(sum(found.values()))
-    total_shares, blocks_found = _lifetime_update(raw_shares, raw_blocks_found)
+    raw_kas_total = int(sum(kas.values()) + sum(kas_pool.values()))
+    total_shares, blocks_found, kas_lifetime = _lifetime_update(raw_shares, raw_blocks_found, raw_kas_total)
 
     # ---- Network + pool hashrate, both grounded in the node ----------------
     # Network = the node's measured EstimateNetworkHashesPerSecond (authoritative;
@@ -643,18 +684,28 @@ def sample():
             "activeWorkers": sum(1 for w in workers if w.get("online")),
             "totalShares": total_shares,
             "totalBlocks": blocks_found,
-            "kasBlocksFound": int(sum(kas.values())),
+            # Pool-wide: every KAS block the pool's hashrate landed, however it was
+            # paid. Split out so the two audiences do not get one confusing number --
+            # `toMiners` is what miners were paid directly, `toPool` is pool revenue
+            # (unset payout addresses plus the one fee minute per lane per hour).
+            "kasBlocksFound": int(kas_lifetime),
+            "kasBlocksToMiners": int(sum(kas.values())),
+            "kasBlocksToPool": int(sum(kas_pool.values())),
             "bridgeUptime": int(now - START),
             "workers": workers,
             "blocks": [],
         })
         bbw = {}
-        for (w, wk) in set(list(found) + list(mined) + list(pending) + list(kas)):
-            d = bbw.setdefault(w, {"found": 0, "confirmed": 0, "pending": 0, "kas": 0})
+        keys = set(list(found) + list(mined) + list(pending) + list(kas) + list(kas_set))
+        for (w, wk) in keys:
+            d = bbw.setdefault(w, {"found": 0, "confirmed": 0, "pending": 0, "kas": 0, "kasPayoutSet": False})
             d["found"] += int(found.get((w, wk), 0))
             d["confirmed"] += int(mined.get((w, wk), 0))
             d["pending"] += int(pending.get((w, wk), 0))
+            # Miner-paid only: this is the miner's own page.
             d["kas"] += int(kas.get((w, wk), 0))
+            if kas_set.get((w, wk), 0.0):
+                d["kasPayoutSet"] = True
         _state["_bbw"] = bbw
 
 
@@ -709,6 +760,8 @@ def redact(stats, bbw):
         # reward: for miners who set a kaspa: address in the stratum password
         # the KAS mints to them, otherwise to the pool's own payout address.
         "kasBlocksFound": stats.get("kasBlocksFound") or 0,
+        "kasBlocksToMiners": stats.get("kasBlocksToMiners") or 0,
+        "kasBlocksToPool": stats.get("kasBlocksToPool") or 0,
         "totalShares": stats.get("totalShares"),
         "bridgeUptime": stats.get("bridgeUptime"),
         "workers": [{
@@ -718,6 +771,7 @@ def redact(stats, bbw):
             "shares": w.get("shares"),
             "blocks": w.get("blocks") or 0,
             "kasBlocks": w.get("kasBlocks") or 0,
+            "kasPayoutSet": bool(w.get("kasPayoutSet")),
             "difficulty": w.get("difficulty"),
             "warmingUp": bool(w.get("warmingUp")),
             "status": w.get("status") or ("online" if w.get("online") else "offline"),
@@ -733,7 +787,7 @@ def redact(stats, bbw):
 def miner(address, stats, bbw):
     address = (address or "").strip()
     workers = [w for w in (stats.get("workers") or []) if w.get("wallet") == address]
-    blk = bbw.get(address, {"found": 0, "confirmed": 0, "pending": 0, "kas": 0})
+    blk = bbw.get(address, {"found": 0, "confirmed": 0, "pending": 0, "kas": 0, "kasPayoutSet": False})
     history = payout_history(address)
     confirmed = blk["confirmed"]
     pending = blk.get("pending") or max(0, blk["found"] - confirmed)
@@ -748,6 +802,7 @@ def miner(address, stats, bbw):
             "shares": w.get("shares") or 0,
             "blocks": w.get("blocks") or 0,
             "kasBlocks": w.get("kasBlocks") or 0,
+            "kasPayoutSet": bool(w.get("kasPayoutSet")),
             "difficulty": w.get("difficulty"),
             "warmingUp": bool(w.get("warmingUp")),
             "online": bool(w.get("online")),
@@ -759,8 +814,14 @@ def miner(address, stats, bbw):
         "totalHashrate": sum((w.get("hashrate") or 0) for w in workers if w.get("online")),  # GH/s
         "totalShares": sum((w.get("shares") or 0) for w in workers),
         "blocksFound": blk["found"],
-        # Kaspa blocks this wallet's workers landed via merged mining.
+        # Kaspa blocks this wallet's workers landed via merged mining AND were paid
+        # for. Blocks whose KAS minted to the pool (no `kaspa:` address set, or the
+        # lane's fee minute) are deliberately not counted here -- showing them reads
+        # as "you were paid this" when the miner received nothing.
         "kasBlocksFound": blk.get("kas", 0),
+        # False => no worker on this wallet has a usable kaspa: payout address, so
+        # the UI must say "not set" rather than print a count.
+        "kasPayoutSet": bool(blk.get("kasPayoutSet")) or any(w.get("kasPayoutSet") for w in workers),
         "blocksConfirmed": confirmed,
         "blocksPending": pending,
         # Use the current consensus value for aggregate balances. Per-block

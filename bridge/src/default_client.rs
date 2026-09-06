@@ -13,7 +13,15 @@ use std::sync::{Arc, LazyLock};
 static BIG_JOB_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r".*(BzMiner|IceRiverMiner).*").unwrap());
 
 /// Regex for matching wallet addresses
-static WALLET_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"kaspa(test|dev)?:([a-z0-9]{61}|[a-z0-9]{63})").unwrap());
+/// Regex for pulling an address out of a noisy username.
+///
+/// The length range is deliberately wide and greedy: ZKas shielded (Orchard)
+/// payloads are 79 characters, Kaspa's are 61 or 63. A match is only ever a
+/// *candidate* -- `clean_wallet` bech32-validates it before returning it,
+/// because a length-bounded match silently truncates a longer address into a
+/// different one, which may itself be valid and belong to somebody else.
+static WALLET_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(kaspa(test|dev)?|zkas|firecash):[a-z0-9]{55,100}").unwrap());
 
 /// Default logger configuration
 pub fn default_logger() {
@@ -325,7 +333,19 @@ pub async fn handle_authorize(
             }
         }
     }
+    let kas_payout_configured = kas_payout.is_some();
     *ctx.kas_payout.lock() = kas_payout;
+
+    // Publish whether this worker will actually be paid its merge-mined KAS, so
+    // the dashboard can show "not set" rather than a block count the miner earned
+    // nothing from. Recorded even when it is `false` -- the absence of a payout
+    // address is exactly the state the miner needs told.
+    if let Some(handler) = client_handler.as_ref() {
+        crate::prom::record_kas_payout_configured(
+            &crate::prom::worker_context(handler.instance_id(), &ctx, ctx.remote_app.lock().clone()),
+            kas_payout_configured,
+        );
+    }
 
     // Open a live `connection_session` row now that the connection has
     // authenticated (B1): the session becomes visible while still
@@ -507,23 +527,40 @@ fn parse_kas_payout(raw: Option<&str>) -> Option<Address> {
     Address::try_from(candidate).ok()
 }
 
+/// Coerce a stratum username into a validated payout address.
+///
+/// Every path out of here is bech32-validated. This function must never return
+/// a string it has not decoded: it feeds the coinbase, so a "close enough"
+/// answer pays somebody else. When nothing validates it returns `Err`, and the
+/// caller's ZKas policy takes over -- the miner keeps mining and the coinbase
+/// goes to the pool -- rather than the miner being dropped.
 fn clean_wallet(input: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Try to decode as Kaspa address (supports kaspa:, kaspatest:, kaspadev:)
+    // An already well-formed address of any prefix we accept wins outright.
     if Address::try_from(input).is_ok() {
         return Ok(input.to_string());
     }
 
-    // Try with kaspa: prefix if no recognized prefix
-    if !input.starts_with("kaspa:") && !input.starts_with("kaspatest:") && !input.starts_with("kaspadev:") {
-        return clean_wallet(&format!("kaspa:{}", input));
+    // A prefix-less username: try each prefix we serve. ZKas comes first
+    // because this is a ZKas pool; Kaspa is still tried so a bare Kaspa
+    // address keeps working as it always did.
+    if !input.contains(':') {
+        for prefix in ["zkas", "firecash", "kaspa", "kaspatest", "kaspadev"] {
+            let candidate = format!("{prefix}:{input}");
+            if Address::try_from(candidate.as_str()).is_ok() {
+                return Ok(candidate);
+            }
+        }
     }
 
-    // Try regex match
-    if let Some(captures) = WALLET_REGEX.find(input) {
-        return Ok(captures.as_str().to_string());
+    // Last resort: an address embedded in a noisy username. Greedy match, and
+    // every candidate is decoded before it is trusted.
+    for m in WALLET_REGEX.find_iter(input) {
+        if Address::try_from(m.as_str()).is_ok() {
+            return Ok(m.as_str().to_string());
+        }
     }
 
-    Err("unable to coerce wallet to valid kaspa address".into())
+    Err("unable to coerce wallet to a valid zkas: or kaspa: address".into())
 }
 
 /// Send extranonce to client
@@ -577,6 +614,55 @@ async fn send_extranonce(ctx: Arc<StratumContext>) -> Result<(), Box<dyn std::er
 
     tracing::debug!("[EXTRANONCE] ===== EXTRANONCE SENT TO {} =====", ctx.remote_addr);
     Ok(())
+}
+
+#[cfg(test)]
+mod wallet_coercion_tests {
+    use super::*;
+
+    // Structurally valid, synthetic. ZKas shielded payloads are 79 chars,
+    // Kaspa's are 61 -- the length gap is what the old regex tripped over.
+    const ZKAS: &str = "zkas:pyxpxx3p9qhnv02yfdf9jcr8de6hequ2jxvflf4dkjau9jws6l0wtm8nlgrq69qmyg5nqdc4tz0wpku";
+    const KASPA: &str = "kaspa:qqvp7f3dxsa5yj2s2a0x2mrn02qc3ruknkj2hv4ecrrua4wuu040z995jlg26";
+
+    #[test]
+    fn a_zkas_address_survives_intact() {
+        assert_eq!(clean_wallet(ZKAS).unwrap(), ZKAS);
+    }
+
+    #[test]
+    fn a_kaspa_address_still_works() {
+        assert_eq!(clean_wallet(KASPA).unwrap(), KASPA);
+    }
+
+    /// Regression: a prefix-less ZKas address used to have `kaspa:` prepended and
+    /// was then cut to Kaspa's 61-char length by the wallet regex. The truncated
+    /// string failed to decode at the node, which disconnected the miner, which
+    /// reconnected -- an endless loop that cost one farm every reward it earned.
+    /// A length-bounded match can also land on a *valid* address belonging to
+    /// somebody else, so the rule is: never return anything undecodable.
+    #[test]
+    fn a_prefixless_zkas_address_is_never_truncated_into_a_kaspa_one() {
+        let bare = ZKAS.strip_prefix("zkas:").unwrap();
+        let got = clean_wallet(bare).expect("a bare zkas address should resolve");
+        assert_eq!(got, ZKAS, "bare address must round-trip to the full zkas address");
+        assert!(!got.starts_with("kaspa:"), "a zkas address must never be re-prefixed as kaspa");
+        assert_eq!(got.len(), ZKAS.len(), "address must not be truncated");
+    }
+
+    #[test]
+    fn an_address_with_a_worker_suffix_is_extracted_whole() {
+        assert_eq!(clean_wallet(&format!("{ZKAS}.rig1")).unwrap(), ZKAS);
+    }
+
+    /// Nothing decodable => `Err`, so the caller applies the pool fallback and
+    /// keeps the miner mining. It must never invent an address.
+    #[test]
+    fn undecodable_input_is_an_error_not_a_guess() {
+        for bad in ["", "invalid_address", "zkas:notarealaddress", &ZKAS[..40]] {
+            assert!(clean_wallet(bad).is_err(), "{bad:?} must not coerce to an address");
+        }
+    }
 }
 
 #[cfg(test)]
