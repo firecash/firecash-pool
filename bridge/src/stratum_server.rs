@@ -44,6 +44,7 @@ pub struct BridgeConfig {
     pub proxy_protocol: bool,
     /// Emit the proxy-compatible Kaspa Common Stratum v1 handshake.
     pub kaspa_common_protocol: bool,
+    pub extranonce_with_size: bool,
 }
 
 /// Start block template listener with concrete KaspaApi
@@ -158,17 +159,19 @@ async fn listen_and_serve_impl<T: KaspaApiTrait + Send + Sync + 'static>(
         Arc::new(handler)
     };
 
-    // Create client handler
-    // Note: extranonce_size parameter is now only used for backward compatibility
-    // Actual extranonce assignment happens per-client in handle_subscribe based on detected miner type
-    let client_handler = Arc::new(ClientHandler::new_with_protocol(
-        Arc::clone(&share_handler),
-        min_diff,
-        port_seeds,
-        extranonce_size,
-        instance_id.clone(),
-        config.kaspa_common_protocol,
-    ));
+    // Create client handler. `extranonce_size` is this listener's configured nonce
+    // prefix width and is honoured per client in handle_subscribe.
+    let client_handler = Arc::new(
+        ClientHandler::new_with_protocol(
+            Arc::clone(&share_handler),
+            min_diff,
+            port_seeds,
+            extranonce_size,
+            instance_id.clone(),
+            config.kaspa_common_protocol,
+        )
+        .with_extranonce_size_param(config.extranonce_with_size),
+    );
 
     // A network-target clear retires that connection's current ZKAS H_fc.
     // Publish replacement work immediately rather than waiting for the

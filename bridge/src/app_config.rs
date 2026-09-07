@@ -27,6 +27,13 @@ pub struct InstanceConfig {
     /// Kryptex. Intended for strict Stratum proxies such as MRR.
     #[serde(default)]
     pub kaspa_common_protocol: bool,
+    /// Send `mining.set_extranonce` as `[prefix, extranonce2_size]` instead of
+    /// `[prefix]`. The one-argument form is what IceRiver and BzMiner have always
+    /// been given here and they infer the size, but a client that reads the second
+    /// argument gets nothing and drops the connection. Off by default so no
+    /// existing listener changes shape.
+    #[serde(default)]
+    pub extranonce_with_size: bool,
 }
 
 /// Global configuration (shared across all instances)
@@ -238,6 +245,7 @@ impl Default for InstanceConfig {
             var_diff_stats: None,
             pow2_clamp: None,
             kaspa_common_protocol: false,
+            extranonce_with_size: false,
         }
     }
 }

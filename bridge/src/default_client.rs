@@ -181,7 +181,7 @@ pub async fn handle_subscribe(
     if !kaspa_common_protocol && remote_app_lower.contains("iceriver") && client_handler.is_some() {
         tracing::info!("[HANDSHAKE] sending pre-authorize extranonce to IceRiver {}:{}", ctx.remote_addr, ctx.remote_port);
         if !extranonce.is_empty() {
-            send_extranonce(ctx.clone()).await?;
+            send_extranonce(ctx.clone(), client_handler.as_ref().is_some_and(|h| h.extranonce_with_size())).await?;
         }
     }
 
@@ -401,7 +401,7 @@ pub async fn handle_authorize(
     if !extranonce.is_empty() && !is_bitmain && !is_iceriver && !kaspa_common_protocol {
         tracing::debug!("[AUTHORIZE] Step 2: Sending extranonce to client {} before difficulty/job", ctx.remote_addr);
         tracing::debug!("[AUTHORIZE] Extranonce value: '{}'", extranonce);
-        send_extranonce(ctx.clone()).await?;
+        send_extranonce(ctx.clone(), client_handler.as_ref().is_some_and(|h| h.extranonce_with_size())).await?;
         tracing::debug!("[AUTHORIZE] Extranonce sent successfully to client {}", ctx.remote_addr);
     } else {
         tracing::debug!("[AUTHORIZE] No extranonce step (empty or bitmain; bitmain gets it via subscribe response)");
@@ -564,7 +564,10 @@ fn clean_wallet(input: &str) -> Result<String, Box<dyn std::error::Error + Send 
 }
 
 /// Send extranonce to client
-async fn send_extranonce(ctx: Arc<StratumContext>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn send_extranonce(
+    ctx: Arc<StratumContext>,
+    with_size: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::debug!("[EXTRANONCE] ===== SENDING EXTRANONCE TO {} =====", ctx.remote_addr);
 
     let remote_app = ctx.remote_app.lock().clone();
@@ -590,6 +593,15 @@ async fn send_extranonce(ctx: Arc<StratumContext>) -> Result<(), Box<dyn std::er
             extranonce.len()
         );
         tracing::debug!("[EXTRANONCE] Bitmain params: ['{}', {}]", extranonce, extranonce2_size);
+        vec![Value::String(extranonce.clone()), Value::Number(extranonce2_size.into())]
+    } else if with_size {
+        // Two-argument form: `[prefix, extranonce2_size]`. A rental proxy reads the
+        // second argument to know how much of the 8-byte nonce it owns; given only
+        // the prefix it has nothing to read and drops the connection. Opt-in per
+        // listener so the miners already served by the one-argument form below are
+        // untouched.
+        let extranonce2_size = 8 - (extranonce.len() / 2);
+        tracing::debug!("[EXTRANONCE] Using two-argument format: ['{}', {}]", extranonce, extranonce2_size);
         vec![Value::String(extranonce.clone()), Value::Number(extranonce2_size.into())]
     } else {
         tracing::debug!("[EXTRANONCE] Using standard format (IceRiver/BzMiner)");

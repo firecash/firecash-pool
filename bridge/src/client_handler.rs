@@ -140,6 +140,8 @@ pub struct ClientHandler {
     share_handler: Arc<ShareHandler>,
     instance_id: String, // Instance identifier for logging
     kaspa_common_protocol: bool,
+    /// Emit `mining.set_extranonce` with the extranonce2 size alongside the prefix.
+    extranonce_with_size: bool,
 }
 
 impl ClientHandler {
@@ -210,6 +212,7 @@ impl ClientHandler {
             share_handler,
             instance_id,
             kaspa_common_protocol,
+            extranonce_with_size: false,
         }
     }
 
@@ -227,6 +230,18 @@ impl ClientHandler {
     /// `default_client.rs` that record per-IP metrics.
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// Builder: opt this listener into the two-argument `mining.set_extranonce`.
+    /// Separate from the constructor so no existing call site changes shape.
+    #[must_use]
+    pub const fn with_extranonce_size_param(mut self, enabled: bool) -> Self {
+        self.extranonce_with_size = enabled;
+        self
+    }
+
+    pub const fn extranonce_with_size(&self) -> bool {
+        self.extranonce_with_size
     }
 
     pub fn kaspa_common_protocol(&self) -> bool {

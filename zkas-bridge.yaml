@@ -70,4 +70,8 @@ instances:
     var_diff: false
     shares_per_min: 20
     extranonce_size: 1
+    # Send `mining.set_extranonce` as [prefix, extranonce2_size]. The other ports
+    # send only the prefix, which IceRiver/BzMiner infer from, but a rental proxy
+    # reads the second value and disconnects when it is absent.
+    extranonce_with_size: true
     log_to_file: false
