@@ -198,3 +198,20 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted for
 inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual-licensed as above, without any additional terms or conditions.
+
+## Bad payout addresses: the pool's policy, stated plainly
+
+If your miner authorizes with an address the bridge cannot decode (after trying
+the `zkas:`, `firecash:` and `kaspa:` prefixes), the pool **does not disconnect
+you**. Your worker keeps mining, but the coinbase of any block you find pays the
+**pool's fallback address** — you forfeit those rewards until you fix the
+address. Every such authorization is logged with a warning on the pool side and
+counted in the pool's metrics.
+
+Why not reject the connection? A rejected `authorize` sends most mining firmware
+into an indefinite reconnect storm that helps nobody. Accept-and-flag keeps the
+worker visible so the problem can be noticed and fixed.
+
+**Check yourself:** your address appears on your miner dashboard page; if your
+worker shows hashrate but no balance accrues, re-check the payout address in
+your miner's configuration first.
